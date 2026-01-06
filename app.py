@@ -21,6 +21,61 @@ def home():
 def health():
     return jsonify({"status": "healthy", "message": "Service is running"})
 
+@app.route('/admin', methods=['GET'])
+def admin():
+    """Fun admin endpoint for keep-alive pings"""
+    import random
+    from datetime import datetime
+    
+    funny_messages = [
+        "🎨 Image processor standing by, captain!",
+        "🖼️ Still here, converting pixels like a boss!",
+        "🎭 Awake and ready to make colors dance!",
+        "🚀 Service online! No images harmed in the making of this response.",
+        "🎪 The pixel circus is open for business!",
+        "🧙‍♂️ Abracadabra! Your image processor is alive!",
+        "🎯 Bulls-eye! Service is up and pixel-perfect!",
+        "🌈 Converting darkness to light since... well, 10 minutes ago!",
+        "⚡ Zap! Another successful keep-alive ping!",
+        "🎸 Rock on! This service is still jamming!",
+        "🍕 Serving hot pixels, not pizza!",
+        "🦸‍♂️ Image processing superhero reporting for duty!",
+        "🎲 Lucky you! Service is still running!",
+        "🏆 Champion status: Still undefeated against sleep mode!",
+        "🎉 Party's not over! Service is still dancing!"
+    ]
+    
+    funny_tips = [
+        "Pro tip: Black pixels hate becoming white. They call it 'identity theft'.",
+        "Did you know? Images processed here are 100% organic and free-range.",
+        "Fun fact: We're powered by enthusiasm and Python magic!",
+        "Reminder: No pixels were harmed in this keep-alive check.",
+        "Secret: The images actually process themselves. We just take credit.",
+        "Breaking: Local image processor refuses to sleep, citing 'too much caffeine'.",
+        "Insider info: The pixels throw a party every time you ping this endpoint.",
+        "Life hack: Always be nice to your image processor. They remember.",
+        "Plot twist: The service was awake this whole time!",
+        "Exclusive: Service claims it 'doesn't even need sleep anyway'."
+    ]
+    
+    status_emojis = ["✨", "🌟", "⭐", "💫", "🔥", "💪", "🎊", "🎈", "🌺", "🦄"]
+    
+    return jsonify({
+        "status": "alive_and_kicking",
+        "message": random.choice(funny_messages),
+        "tip": random.choice(funny_tips),
+        "emoji": random.choice(status_emojis),
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "uptime_excuse": "I was just resting my eyes, I swear!",
+        "service_mood": random.choice(["Excellent", "Spectacular", "Fantastic", "Phenomenal", "Energetic"]),
+        "pixels_processed_today": random.randint(1000, 9999),
+        "coffee_level": f"{random.randint(60, 100)}%",
+        "motivation_level": "Over 9000!",
+        "secret_message": "🤫 You found the secret admin endpoint!",
+        "fun_fact": f"This is ping #{random.randint(1, 999)} today!",
+        "next_nap_in": "Not today, Satan! ☕"
+    })
+    
 @app.route('/replace-dark-to-white', methods=['POST'])
 def replace_dark():
     try:
