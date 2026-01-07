@@ -109,12 +109,10 @@ def admin():
 @app.route('/force-solid-black', methods=['POST'])
 def force_solid_black():
     """
-    Convert ANY logo to solid black
-    - Preserves transparency/alpha channel
-    - Ignores all colors, gradients, everything
-    - Makes all non-transparent pixels pure black
-    
-    Perfect for: Creating silhouettes, black versions for light backgrounds
+    Convert ANY logo to solid black while PRESERVING transparency
+    - Only affects non-transparent pixels
+    - Transparent areas stay 100% transparent
+    - Perfect for silhouettes on any background
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -129,23 +127,22 @@ def force_solid_black():
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
         
-        # Open image
+        # Open image and ensure RGBA mode
         img = Image.open(file.stream).convert('RGBA')
         data = np.array(img)
         
-        # Get alpha channel
-        alpha = data[:, :, 3]
+        # Extract RGBA channels
+        r, g, b, alpha = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
         
-        # Create solid black RGB (where not transparent)
-        # All RGB channels = 0 (black)
-        data[:, :, 0] = 0  # Red = 0
-        data[:, :, 1] = 0  # Green = 0
-        data[:, :, 2] = 0  # Blue = 0
-        # Alpha stays unchanged
+        # Create mask for non-transparent pixels only
+        non_transparent_mask = alpha > 0
         
-        # Alternatively, only affect non-transparent pixels:
-        # non_transparent = alpha > 0
-        # data[non_transparent, 0:3] = [0, 0, 0]
+        # Make only non-transparent pixels black
+        # Keep RGB as is for transparent pixels
+        data[non_transparent_mask, 0] = 0    # Red = 0
+        data[non_transparent_mask, 1] = 0    # Green = 0
+        data[non_transparent_mask, 2] = 0    # Blue = 0
+        # Alpha channel is NOT modified at all
         
         result_img = Image.fromarray(data, 'RGBA')
         
@@ -154,7 +151,8 @@ def force_solid_black():
         output.seek(0)
         
         # Calculate stats
-        non_transparent_pixels = np.sum(alpha > 0)
+        non_transparent_pixels = np.sum(non_transparent_mask)
+        transparent_pixels = np.sum(alpha == 0)
         total_pixels = alpha.size
         
         response = send_file(
@@ -165,8 +163,10 @@ def force_solid_black():
         )
         
         response.headers['X-Pixels-Changed'] = str(non_transparent_pixels)
+        response.headers['X-Transparent-Pixels'] = str(transparent_pixels)
         response.headers['X-Total-Pixels'] = str(total_pixels)
         response.headers['X-Output-Color'] = 'BLACK'
+        response.headers['X-Transparency-Preserved'] = 'YES'
         
         return response
         
@@ -180,12 +180,10 @@ def force_solid_black():
 @app.route('/force-solid-white', methods=['POST'])
 def force_solid_white():
     """
-    Convert ANY logo to solid white
-    - Preserves transparency/alpha channel
-    - Ignores all colors, gradients, everything
-    - Makes all non-transparent pixels pure white
-    
-    Perfect for: White versions for dark backgrounds
+    Convert ANY logo to solid white while PRESERVING transparency
+    - Only affects non-transparent pixels
+    - Transparent areas stay 100% transparent
+    - Perfect for white logos on dark backgrounds
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -200,19 +198,22 @@ def force_solid_white():
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
         
-        # Open image
+        # Open image and ensure RGBA mode
         img = Image.open(file.stream).convert('RGBA')
         data = np.array(img)
         
-        # Get alpha channel
-        alpha = data[:, :, 3]
+        # Extract RGBA channels
+        r, g, b, alpha = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
         
-        # Create solid white RGB (where not transparent)
-        # All RGB channels = 255 (white)
-        data[:, :, 0] = 255  # Red = 255
-        data[:, :, 1] = 255  # Green = 255
-        data[:, :, 2] = 255  # Blue = 255
-        # Alpha stays unchanged
+        # Create mask for non-transparent pixels only
+        non_transparent_mask = alpha > 0
+        
+        # Make only non-transparent pixels white
+        # Keep RGB as is for transparent pixels
+        data[non_transparent_mask, 0] = 255  # Red = 255
+        data[non_transparent_mask, 1] = 255  # Green = 255
+        data[non_transparent_mask, 2] = 255  # Blue = 255
+        # Alpha channel is NOT modified at all
         
         result_img = Image.fromarray(data, 'RGBA')
         
@@ -221,7 +222,8 @@ def force_solid_white():
         output.seek(0)
         
         # Calculate stats
-        non_transparent_pixels = np.sum(alpha > 0)
+        non_transparent_pixels = np.sum(non_transparent_mask)
+        transparent_pixels = np.sum(alpha == 0)
         total_pixels = alpha.size
         
         response = send_file(
@@ -232,8 +234,10 @@ def force_solid_white():
         )
         
         response.headers['X-Pixels-Changed'] = str(non_transparent_pixels)
+        response.headers['X-Transparent-Pixels'] = str(transparent_pixels)
         response.headers['X-Total-Pixels'] = str(total_pixels)
         response.headers['X-Output-Color'] = 'WHITE'
+        response.headers['X-Transparency-Preserved'] = 'YES'
         
         return response
         
