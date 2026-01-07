@@ -88,6 +88,40 @@ def admin():
         "motivation": "Over 9000! ☕"
     })
 
+@app.route('/check-dependencies', methods=['GET'])
+def check_dependencies():
+    """Check if all dependencies are available"""
+    deps = {}
+    
+    try:
+        import flask
+        deps['flask'] = flask.__version__
+    except:
+        deps['flask'] = 'NOT INSTALLED'
+    
+    try:
+        import PIL
+        deps['pillow'] = PIL.__version__
+    except:
+        deps['pillow'] = 'NOT INSTALLED'
+    
+    try:
+        import numpy
+        deps['numpy'] = numpy.__version__
+    except:
+        deps['numpy'] = 'NOT INSTALLED'
+    
+    try:
+        import cv2
+        deps['opencv'] = cv2.__version__
+    except Exception as e:
+        deps['opencv'] = f'NOT INSTALLED: {str(e)}'
+    
+    return jsonify({
+        "dependencies": deps,
+        "opencv_available": 'cv2' in dir()
+    })
+
 @app.route('/replace-dark-to-white', methods=['POST'])
 def replace_dark():
     """Replace dark colors with white"""
