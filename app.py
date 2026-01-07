@@ -104,6 +104,67 @@ def admin():
         "coffee_level": f"{random.randint(60, 100)}%"
     })
 
+@app.route('/debug-smart-color', methods=['POST'])
+def debug_smart_color():
+    """Debug version - shows why smart-color-replace fails"""
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        target_type = request.form.get('target_type', 'dark').lower()
+        
+        img = Image.open(file.stream).convert('RGBA')
+        rgb = img.convert('RGB')
+        rgb_array = np.array(rgb)
+        
+        # Convert to HSV
+        hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV).astype(np.float32)
+        h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+        
+        # Test each condition
+        kernel_size = 5
+        h_var = cv2.blur(h**2, (kernel_size, kernel_size)) - cv2.blur(h, (kernel_size, kernel_size))**2
+        s_var = cv2.blur(s**2, (kernel_size, kernel_size)) - cv2.blur(s, (kernel_size, kernel_size))**2
+        v_var = cv2.blur(v**2, (kernel_size, kernel_size)) - cv2.blur(v, (kernel_size, kernel_size))**2
+        total_var = h_var + s_var + v_var
+        
+        solid_mask = total_var < 100
+        colored_mask = s > 30
+        
+        if target_type == 'light':
+            brightness_mask = v > 150
+        else:
+            brightness_mask = v < 120
+        
+        target_mask = solid_mask & colored_mask & brightness_mask
+        
+        total_pixels = h.size
+        
+        return jsonify({
+            "image_size": f"{rgb_array.shape[1]}x{rgb_array.shape[0]}",
+            "total_pixels": int(total_pixels),
+            "results": {
+                "solid_pixels": int(np.sum(solid_mask)),
+                "solid_percentage": f"{(np.sum(solid_mask)/total_pixels)*100:.2f}%",
+                "colored_pixels": int(np.sum(colored_mask)),
+                "colored_percentage": f"{(np.sum(colored_mask)/total_pixels)*100:.2f}%",
+                "brightness_matched": int(np.sum(brightness_mask)),
+                "brightness_percentage": f"{(np.sum(brightness_mask)/total_pixels)*100:.2f}%",
+                "final_matched": int(np.sum(target_mask)),
+                "final_percentage": f"{(np.sum(target_mask)/total_pixels)*100:.2f}%"
+            },
+            "diagnosis": "PASS" if np.sum(target_mask) > 0 else "FAIL - No pixels meet all criteria",
+            "likely_reason": "Image has gradients (not solid colors)" if np.sum(solid_mask) < (total_pixels * 0.1) else "Check brightness_type parameter"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+        
 @app.route('/replace-dark-to-white', methods=['POST'])
 def replace_dark():
     """Replace dark colors with white"""
