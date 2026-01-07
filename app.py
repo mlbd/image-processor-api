@@ -41,6 +41,8 @@ def home():
             "/replace-light-to-dark": "POST - Replace light colors with dark",
             "/replace-to-color": "POST - Replace dark/light to any color (RECOMMENDED)",
             "/smart-color-replace": "POST - Auto-detect and replace solid colors",
+            "/force-solid-black": "POST - Force entire logo to solid black ⭐",
+            "/force-solid-white": "POST - Force entire logo to solid white ⭐",
             "/invert-colors": "POST - Invert all colors"
         }
     })
@@ -104,6 +106,143 @@ def admin():
         "coffee_level": f"{random.randint(60, 100)}%"
     })
 
+@app.route('/force-solid-black', methods=['POST'])
+def force_solid_black():
+    """
+    Convert ANY logo to solid black
+    - Preserves transparency/alpha channel
+    - Ignores all colors, gradients, everything
+    - Makes all non-transparent pixels pure black
+    
+    Perfect for: Creating silhouettes, black versions for light backgrounds
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+        
+        # Open image
+        img = Image.open(file.stream).convert('RGBA')
+        data = np.array(img)
+        
+        # Get alpha channel
+        alpha = data[:, :, 3]
+        
+        # Create solid black RGB (where not transparent)
+        # All RGB channels = 0 (black)
+        data[:, :, 0] = 0  # Red = 0
+        data[:, :, 1] = 0  # Green = 0
+        data[:, :, 2] = 0  # Blue = 0
+        # Alpha stays unchanged
+        
+        # Alternatively, only affect non-transparent pixels:
+        # non_transparent = alpha > 0
+        # data[non_transparent, 0:3] = [0, 0, 0]
+        
+        result_img = Image.fromarray(data, 'RGBA')
+        
+        output = BytesIO()
+        result_img.save(output, format='PNG')
+        output.seek(0)
+        
+        # Calculate stats
+        non_transparent_pixels = np.sum(alpha > 0)
+        total_pixels = alpha.size
+        
+        response = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name='solid_black.png'
+        )
+        
+        response.headers['X-Pixels-Changed'] = str(non_transparent_pixels)
+        response.headers['X-Total-Pixels'] = str(total_pixels)
+        response.headers['X-Output-Color'] = 'BLACK'
+        
+        return response
+        
+    except Exception as e:
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e)
+        }), 500
+
+
+@app.route('/force-solid-white', methods=['POST'])
+def force_solid_white():
+    """
+    Convert ANY logo to solid white
+    - Preserves transparency/alpha channel
+    - Ignores all colors, gradients, everything
+    - Makes all non-transparent pixels pure white
+    
+    Perfect for: White versions for dark backgrounds
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+        
+        # Open image
+        img = Image.open(file.stream).convert('RGBA')
+        data = np.array(img)
+        
+        # Get alpha channel
+        alpha = data[:, :, 3]
+        
+        # Create solid white RGB (where not transparent)
+        # All RGB channels = 255 (white)
+        data[:, :, 0] = 255  # Red = 255
+        data[:, :, 1] = 255  # Green = 255
+        data[:, :, 2] = 255  # Blue = 255
+        # Alpha stays unchanged
+        
+        result_img = Image.fromarray(data, 'RGBA')
+        
+        output = BytesIO()
+        result_img.save(output, format='PNG')
+        output.seek(0)
+        
+        # Calculate stats
+        non_transparent_pixels = np.sum(alpha > 0)
+        total_pixels = alpha.size
+        
+        response = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name='solid_white.png'
+        )
+        
+        response.headers['X-Pixels-Changed'] = str(non_transparent_pixels)
+        response.headers['X-Total-Pixels'] = str(total_pixels)
+        response.headers['X-Output-Color'] = 'WHITE'
+        
+        return response
+        
+    except Exception as e:
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e)
+        }), 500
+        
 @app.route('/debug-smart-color', methods=['POST'])
 def debug_smart_color():
     """Debug version - shows why smart-color-replace fails"""
