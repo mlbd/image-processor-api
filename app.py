@@ -364,7 +364,7 @@ def replace_to_color():
 def smart_color_replace():
     """
     Auto-detect dominant solid color and replace it
-    More complex but may not work with all images
+    Fixed version with better saturation handling
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -377,6 +377,9 @@ def smart_color_replace():
         file = request.files['image']
         new_hue = int(request.form.get('new_hue', 0))
         target_type = request.form.get('target_type', 'dark').lower()
+        
+        # Optional: allow custom saturation threshold
+        min_saturation = int(request.form.get('min_saturation', 10))  # Lowered from 30
         
         img = Image.open(file.stream).convert('RGBA')
         rgb = img.convert('RGB')
@@ -397,7 +400,7 @@ def smart_color_replace():
         
         # Masks
         solid_mask = total_var < 100
-        colored_mask = s > 30
+        colored_mask = s > min_saturation  # FIXED: Lower threshold
         
         if target_type == 'light':
             brightness_mask = v > 150
@@ -406,12 +409,19 @@ def smart_color_replace():
         
         target_mask = solid_mask & colored_mask & brightness_mask
         
+        # If still no match, try without solid requirement
         if not np.any(target_mask):
-            return jsonify({
-                "error": f"No solid {target_type} colored areas found",
-                "suggestion": f"Try target_type='{('light' if target_type == 'dark' else 'dark')}' or use /replace-to-color instead",
-                "hint": "/replace-to-color is more reliable for most images"
-            }), 400
+            target_mask = colored_mask & brightness_mask
+            
+            if not np.any(target_mask):
+                # Last resort: ignore saturation requirement for very desaturated images
+                target_mask = brightness_mask
+                
+                if not np.any(target_mask):
+                    return jsonify({
+                        "error": f"No {target_type} pixels found",
+                        "suggestion": f"Try target_type='{('light' if target_type == 'dark' else 'dark')}'"
+                    }), 400
         
         # Find dominant hue
         valid_hues = h[target_mask]
@@ -419,15 +429,22 @@ def smart_color_replace():
         dominant_bin = np.argmax(hist)
         dominant_hue = (bin_edges[dominant_bin] + bin_edges[dominant_bin + 1]) / 2
         
-        # Match similar hues
+        # Match similar hues (more lenient tolerance)
         hue_diff = np.abs(h - dominant_hue)
         hue_diff = np.minimum(hue_diff, 180 - hue_diff)
-        hue_match = hue_diff < 20
+        hue_match = hue_diff < 40  # Increased from 20
         
         final_mask = target_mask & hue_match
         
+        # If still no match after hue filtering, just use brightness mask
+        if not np.any(final_mask):
+            final_mask = target_mask
+        
         # Replace hue
         hsv[:,:,0][final_mask] = new_hue / 2
+        
+        # Boost saturation to make color visible
+        hsv[:,:,1][final_mask] = np.maximum(hsv[:,:,1][final_mask], 100)
         
         # Convert back
         result_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
@@ -440,12 +457,21 @@ def smart_color_replace():
         result_img.save(output, format='PNG')
         output.seek(0)
         
-        return send_file(
+        pixels_changed = np.sum(final_mask)
+        percentage = (pixels_changed / h.size) * 100
+        
+        response = send_file(
             output,
             mimetype='image/png',
             as_attachment=True,
             download_name=f'smart_replaced_{target_type}.png'
         )
+        
+        response.headers['X-Detected-Hue'] = str(int(dominant_hue * 2))
+        response.headers['X-Pixels-Changed'] = str(int(pixels_changed))
+        response.headers['X-Change-Percentage'] = f"{percentage:.2f}%"
+        
+        return response
         
     except Exception as e:
         import traceback
