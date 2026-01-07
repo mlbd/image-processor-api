@@ -106,6 +106,189 @@ def admin():
         "coffee_level": f"{random.randint(60, 100)}%"
     })
 
+@app.route('/force-solid-with-outline', methods=['POST'])
+def force_solid_with_outline():
+    """
+    Convert logo to solid color while keeping it readable
+    Adds outline/stroke to preserve shape definition
+    
+    Parameters:
+    - image: file (required)
+    - fill_color: 'black' or 'white' (default: 'black')
+    - outline_color: 'white' or 'black' (default: opposite of fill)
+    - outline_width: integer pixels (default: 3)
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        
+        # Get parameters
+        fill_color = request.form.get('fill_color', 'black').lower()
+        outline_color = request.form.get('outline_color', None)
+        outline_width = int(request.form.get('outline_width', 3))
+        
+        # Auto-set outline color to contrast with fill
+        if outline_color is None:
+            outline_color = 'white' if fill_color == 'black' else 'black'
+        
+        # Open image
+        img = Image.open(file.stream).convert('RGBA')
+        
+        # Get original alpha channel (shape of logo)
+        original_alpha = img.split()[3]
+        
+        # Create solid color version
+        if fill_color == 'white':
+            solid_fill = Image.new('RGB', img.size, (255, 255, 255))
+        else:
+            solid_fill = Image.new('RGB', img.size, (0, 0, 0))
+        
+        # Create outline by dilating the alpha channel
+        # This makes the shape slightly bigger
+        alpha_array = np.array(original_alpha)
+        
+        # Use morphological dilation to create outline
+        kernel = np.ones((outline_width * 2 + 1, outline_width * 2 + 1), np.uint8)
+        dilated = cv2.dilate(alpha_array, kernel, iterations=1)
+        
+        # The outline is the difference between dilated and original
+        outline_mask = (dilated > 0) & (alpha_array == 0)
+        
+        # Create outline image
+        if outline_color == 'white':
+            outline_img = Image.new('RGBA', img.size, (255, 255, 255, 0))
+        else:
+            outline_img = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        
+        outline_data = np.array(outline_img)
+        if outline_color == 'white':
+            outline_data[outline_mask] = [255, 255, 255, 255]
+        else:
+            outline_data[outline_mask] = [0, 0, 0, 255]
+        
+        outline_img = Image.fromarray(outline_data, 'RGBA')
+        
+        # Composite: outline first, then solid fill on top
+        result = Image.new('RGBA', img.size, (0, 0, 0, 0))
+        result.paste(outline_img, (0, 0), outline_img)
+        result.paste(solid_fill, (0, 0), original_alpha)
+        
+        # Save
+        output = BytesIO()
+        result.save(output, format='PNG')
+        output.seek(0)
+        
+        return send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name=f'solid_{fill_color}_with_outline.png'
+        )
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+@app.route('/force-solid-readable', methods=['POST'])
+def force_solid_readable():
+    """
+    Convert logo to solid color while keeping ALL details readable
+    Detects edges (internal lines + outer strokes) and inverts them
+    
+    Parameters:
+    - image: file (required)
+    - base_color: 'black' or 'white' (default: 'black')
+    - edge_threshold: 10-255 (default: 30, lower=more sensitive)
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        base_color = request.form.get('base_color', 'black').lower()
+        edge_threshold = int(request.form.get('edge_threshold', 30))
+        
+        # Open image
+        img = Image.open(file.stream).convert('RGBA')
+        
+        # Get alpha channel and RGB
+        rgb = img.convert('RGB')
+        alpha = img.split()[3]
+        rgb_array = np.array(rgb)
+        alpha_array = np.array(alpha)
+        
+        # Convert to grayscale for edge detection
+        gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+        
+        # Detect edges using Canny or Sobel
+        edges = cv2.Canny(gray, edge_threshold, edge_threshold * 2)
+        
+        # Also detect edges in alpha channel (outer boundaries)
+        alpha_edges = cv2.Canny(alpha_array, 50, 150)
+        
+        # Combine both edge detections
+        all_edges = cv2.bitwise_or(edges, alpha_edges)
+        
+        # Dilate edges slightly to make them more visible
+        kernel = np.ones((2, 2), np.uint8)
+        all_edges = cv2.dilate(all_edges, kernel, iterations=1)
+        
+        # Create result image
+        result = np.zeros((img.height, img.width, 4), dtype=np.uint8)
+        
+        # Set base color
+        if base_color == 'white':
+            result[:, :, 0:3] = 255  # RGB = white
+        else:
+            result[:, :, 0:3] = 0    # RGB = black
+        
+        # Set contrasting color for edges
+        edge_mask = all_edges > 0
+        if base_color == 'white':
+            result[edge_mask, 0:3] = [0, 0, 0]    # Black edges on white
+        else:
+            result[edge_mask, 0:3] = [255, 255, 255]  # White edges on black
+        
+        # Apply original alpha channel
+        result[:, :, 3] = alpha_array
+        
+        # Create final image
+        result_img = Image.fromarray(result, 'RGBA')
+        
+        # Save
+        output = BytesIO()
+        result_img.save(output, format='PNG')
+        output.seek(0)
+        
+        return send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name=f'solid_{base_color}_readable.png'
+        )
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+        
 @app.route('/force-solid-black', methods=['POST'])
 def force_solid_black():
     """
