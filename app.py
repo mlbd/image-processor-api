@@ -254,7 +254,7 @@ def smart_color_replace():
             return jsonify({"error": "Failed to calculate variance", "details": str(e)}), 500
         
         # Solid color mask (low variance = solid)
-        variance_threshold = 100
+        variance_threshold = 200
         solid_mask = total_variance < variance_threshold
         
         # Colored pixels only (not gray)
@@ -365,6 +365,84 @@ def smart_color_replace():
             "traceback": traceback.format_exc()
         }), 500
 
+@app.route('/replace-dark-with-color', methods=['POST'])
+def replace_dark_with_color():
+    """
+    Simple: Replace dark colors with any color (HSV-based for quality)
+    Works exactly like replace-dark-to-white but with any target color
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        threshold = int(request.form.get('threshold', 100))
+        new_hue = int(request.form.get('new_hue', 0))  # Target color
+        
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        img = Image.open(file.stream).convert('RGBA')
+        
+        rgb = img.convert('RGB')
+        alpha = img.split()[3] if img.mode == 'RGBA' else None
+        rgb_array = np.array(rgb)
+        
+        # Convert to HSV
+        hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV).astype(np.float32)
+        h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+        
+        # Find dark pixels (simple brightness check)
+        dark_mask = v < threshold
+        
+        if not np.any(dark_mask):
+            return jsonify({"error": "No dark pixels found"}), 400
+        
+        # Replace hue of dark pixels
+        hsv[:,:,0][dark_mask] = new_hue / 2
+        
+        # Boost saturation so color is visible
+        hsv[:,:,1][dark_mask] = np.maximum(hsv[:,:,1][dark_mask], 100)
+        
+        # Convert back
+        result_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        result_img = Image.fromarray(result_rgb, 'RGB')
+        
+        if alpha:
+            result_img.putalpha(alpha)
+        
+        output = BytesIO()
+        result_img.save(output, format='PNG')
+        output.seek(0)
+        
+        return send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name='color_replaced.png'
+        )
+        
+    except Exception as e:
+        return jsonify({"error": "Processing failed", "details": str(e)}), 500
+
+@app.route('/test-smart-color-replace', methods=['POST'])
+def test_smart_color_replace():
+    """Debug version - shows what's being received"""
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    return jsonify({
+        "received_files": list(request.files.keys()),
+        "received_form": dict(request.form),
+        "received_headers": dict(request.headers),
+        "file_info": {
+            "filename": request.files.get('image').filename if 'image' in request.files else None,
+            "content_type": request.files.get('image').content_type if 'image' in request.files else None
+        } if 'image' in request.files else "No image"
+    })
+    
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=DEBUG)
