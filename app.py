@@ -181,96 +181,167 @@ def replace_specific_color():
 def smart_color_replace():
     """
     Automatically detect and replace the main SOLID color (dark or light)
-    - Ignores gradients and multi-color areas
-    - Only replaces uniform/solid colored regions
     """
     auth_error = verify_api_key()
     if auth_error:
         return auth_error
     
     try:
+        # Check for image first
         if 'image' not in request.files:
-            return jsonify({"error": "No image file provided"}), 400
-        
-        # Parameters
-        new_hue = int(request.form.get('new_hue', 0))
-        target_type = request.form.get('target_type', 'dark').lower()
+            return jsonify({
+                "error": "No image file provided",
+                "received_files": list(request.files.keys()),
+                "received_form": list(request.form.keys())
+            }), 400
         
         file = request.files['image']
-        img = Image.open(file.stream).convert('RGBA')
         
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+        
+        # Get parameters with better validation
+        try:
+            new_hue = int(request.form.get('new_hue', 0))
+        except (ValueError, TypeError):
+            return jsonify({"error": "new_hue must be an integer (0-360)"}), 400
+        
+        target_type = request.form.get('target_type', 'dark').lower()
+        
+        if target_type not in ['dark', 'light']:
+            return jsonify({"error": "target_type must be 'dark' or 'light'"}), 400
+        
+        # Open and validate image
+        try:
+            img = Image.open(file.stream).convert('RGBA')
+        except Exception as e:
+            return jsonify({"error": "Invalid image file", "details": str(e)}), 400
+        
+        # Get RGB and alpha
         rgb = img.convert('RGB')
         alpha = img.split()[3] if img.mode == 'RGBA' else None
         rgb_array = np.array(rgb)
         
+        # Check if image is not empty
+        if rgb_array.size == 0:
+            return jsonify({"error": "Image is empty"}), 400
+        
         # Convert to HSV
-        hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV).astype(np.float32)
+        try:
+            hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV).astype(np.float32)
+        except Exception as e:
+            return jsonify({"error": "Failed to convert image to HSV", "details": str(e)}), 500
+        
         h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
         
         # Calculate local variance for solid color detection
         kernel_size = 5
-        h_variance = cv2.blur(h**2, (kernel_size, kernel_size)) - cv2.blur(h, (kernel_size, kernel_size))**2
-        s_variance = cv2.blur(s**2, (kernel_size, kernel_size)) - cv2.blur(s, (kernel_size, kernel_size))**2
-        v_variance = cv2.blur(v**2, (kernel_size, kernel_size)) - cv2.blur(v, (kernel_size, kernel_size))**2
+        try:
+            h_blur = cv2.blur(h, (kernel_size, kernel_size))
+            h_blur_sq = cv2.blur(h**2, (kernel_size, kernel_size))
+            h_variance = h_blur_sq - h_blur**2
+            
+            s_blur = cv2.blur(s, (kernel_size, kernel_size))
+            s_blur_sq = cv2.blur(s**2, (kernel_size, kernel_size))
+            s_variance = s_blur_sq - s_blur**2
+            
+            v_blur = cv2.blur(v, (kernel_size, kernel_size))
+            v_blur_sq = cv2.blur(v**2, (kernel_size, kernel_size))
+            v_variance = v_blur_sq - v_blur**2
+            
+            total_variance = h_variance + s_variance + v_variance
+        except Exception as e:
+            return jsonify({"error": "Failed to calculate variance", "details": str(e)}), 500
         
-        total_variance = h_variance + s_variance + v_variance
-        
-        # Solid color mask
+        # Solid color mask (low variance = solid)
         variance_threshold = 100
         solid_mask = total_variance < variance_threshold
         
-        # Colored pixels only
+        # Colored pixels only (not gray)
         saturation_threshold = 30
         colored_mask = s > saturation_threshold
         
-        # Dark or light filter
+        # Filter by brightness (dark or light)
         if target_type == 'light':
             brightness_mask = v > 150
         else:
             brightness_mask = v < 120
         
-        # Combine masks
+        # Combine all masks
         target_mask = solid_mask & colored_mask & brightness_mask
         
-        if not np.any(target_mask):
+        # Count how many pixels match
+        matching_pixels = np.sum(target_mask)
+        total_pixels = h.size
+        
+        if matching_pixels == 0:
             return jsonify({
-                "error": f"No solid {target_type} colored areas found",
-                "suggestion": f"Try 'target_type': '{'light' if target_type == 'dark' else 'dark'}'"
+                "error": f"No solid {target_type} colored areas found in image",
+                "suggestion": f"Try target_type='{('light' if target_type == 'dark' else 'dark')}'",
+                "debug_info": {
+                    "total_pixels": int(total_pixels),
+                    "solid_pixels": int(np.sum(solid_mask)),
+                    "colored_pixels": int(np.sum(colored_mask)),
+                    "brightness_matched": int(np.sum(brightness_mask)),
+                    "final_matched": int(matching_pixels)
+                }
             }), 400
         
-        # Find dominant hue
+        # Find dominant hue among valid pixels
         valid_hues = h[target_mask]
-        hist, bin_edges = np.histogram(valid_hues, bins=36, range=(0, 180))
-        dominant_hue_bin = np.argmax(hist)
-        dominant_hue = (bin_edges[dominant_hue_bin] + bin_edges[dominant_hue_bin + 1]) / 2
         
-        # Create final mask
+        try:
+            hist, bin_edges = np.histogram(valid_hues, bins=36, range=(0, 180))
+            dominant_hue_bin = np.argmax(hist)
+            dominant_hue = (bin_edges[dominant_hue_bin] + bin_edges[dominant_hue_bin + 1]) / 2
+        except Exception as e:
+            return jsonify({"error": "Failed to find dominant color", "details": str(e)}), 500
+        
+        # Create hue matching mask
         hue_tolerance = 20
         hue_diff = np.abs(h - dominant_hue)
         hue_diff = np.minimum(hue_diff, 180 - hue_diff)
         hue_match_mask = hue_diff < hue_tolerance
         
+        # Final mask
         final_mask = target_mask & hue_match_mask
         
-        # Replace hue only
+        replaced_pixels = np.sum(final_mask)
+        
+        if replaced_pixels == 0:
+            return jsonify({
+                "error": "No pixels matched the dominant color pattern",
+                "debug_info": {
+                    "dominant_hue_detected": int(dominant_hue * 2),
+                    "target_type": target_type,
+                    "pixels_in_target_range": int(matching_pixels)
+                }
+            }), 400
+        
+        # Replace hue only (preserve saturation and value)
         hsv[:,:,0][final_mask] = new_hue / 2
         
-        # Convert back
-        result_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        # Convert back to RGB
+        try:
+            result_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        except Exception as e:
+            return jsonify({"error": "Failed to convert back to RGB", "details": str(e)}), 500
+        
         result_img = Image.fromarray(result_rgb, 'RGB')
         
+        # Reapply alpha
         if alpha:
             result_img.putalpha(alpha)
         
+        # Save to output
         output = BytesIO()
         result_img.save(output, format='PNG')
         output.seek(0)
         
-        # Stats
-        total_pixels = h.size
-        replaced_pixels = np.sum(final_mask)
+        # Calculate stats
         percentage = (replaced_pixels / total_pixels) * 100
         
+        # Create response
         response = send_file(
             output,
             mimetype='image/png',
@@ -278,14 +349,21 @@ def smart_color_replace():
             download_name=f'smart_replaced_{target_type}.png'
         )
         
+        # Add metadata headers
         response.headers['X-Detected-Hue'] = str(int(dominant_hue * 2))
-        response.headers['X-Pixels-Changed'] = str(replaced_pixels)
+        response.headers['X-Pixels-Changed'] = str(int(replaced_pixels))
         response.headers['X-Change-Percentage'] = f"{percentage:.2f}%"
+        response.headers['X-Target-Type'] = target_type
         
         return response
         
     except Exception as e:
-        return jsonify({"error": "Processing failed", "details": str(e)}), 500
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
