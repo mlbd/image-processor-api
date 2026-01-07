@@ -203,12 +203,12 @@ def force_solid_with_outline():
 def force_solid_readable():
     """
     Convert logo to solid color while keeping ALL details readable
-    Detects edges (internal lines + outer strokes) and inverts them
+    Uses luminance-based edge preservation for better results
     
     Parameters:
     - image: file (required)
-    - base_color: 'black' or 'white' (default: 'black')
-    - edge_threshold: 10-255 (default: 30, lower=more sensitive)
+    - base_color: 'black' or 'white' (default: 'white')
+    - edge_strength: 1-10 (default: 3, higher=thicker edges)
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -219,67 +219,165 @@ def force_solid_readable():
             return jsonify({"error": "No image file provided"}), 400
         
         file = request.files['image']
-        base_color = request.form.get('base_color', 'black').lower()
-        edge_threshold = int(request.form.get('edge_threshold', 30))
+        base_color = request.form.get('base_color', 'white').lower()
+        edge_strength = int(request.form.get('edge_strength', 3))
         
         # Open image
         img = Image.open(file.stream).convert('RGBA')
+        rgb = np.array(img.convert('RGB'))
+        alpha = np.array(img.split()[3])
         
-        # Get alpha channel and RGB
-        rgb = img.convert('RGB')
-        alpha = img.split()[3]
-        rgb_array = np.array(rgb)
-        alpha_array = np.array(alpha)
+        # Convert to grayscale to detect luminance differences
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         
-        # Convert to grayscale for edge detection
-        gray = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2GRAY)
+        # Method 1: Use Sobel edge detection (better for internal lines)
+        sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+        sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+        sobel_edges = np.sqrt(sobelx**2 + sobely**2)
         
-        # Detect edges using Canny or Sobel
-        edges = cv2.Canny(gray, edge_threshold, edge_threshold * 2)
+        # Normalize and threshold
+        sobel_edges = (sobel_edges / sobel_edges.max() * 255).astype(np.uint8)
+        _, edge_mask = cv2.threshold(sobel_edges, 20, 255, cv2.THRESH_BINARY)
         
-        # Also detect edges in alpha channel (outer boundaries)
-        alpha_edges = cv2.Canny(alpha_array, 50, 150)
+        # Thicken edges based on strength parameter
+        if edge_strength > 1:
+            kernel = np.ones((edge_strength, edge_strength), np.uint8)
+            edge_mask = cv2.dilate(edge_mask, kernel, iterations=1)
         
-        # Combine both edge detections
-        all_edges = cv2.bitwise_or(edges, alpha_edges)
-        
-        # Dilate edges slightly to make them more visible
-        kernel = np.ones((2, 2), np.uint8)
-        all_edges = cv2.dilate(all_edges, kernel, iterations=1)
-        
-        # Create result image
+        # Create result
         result = np.zeros((img.height, img.width, 4), dtype=np.uint8)
         
-        # Set base color
-        if base_color == 'white':
-            result[:, :, 0:3] = 255  # RGB = white
-        else:
-            result[:, :, 0:3] = 0    # RGB = black
+        # Set base color for all non-transparent pixels
+        non_transparent = alpha > 0
         
-        # Set contrasting color for edges
-        edge_mask = all_edges > 0
         if base_color == 'white':
-            result[edge_mask, 0:3] = [0, 0, 0]    # Black edges on white
+            result[non_transparent, 0:3] = [255, 255, 255]  # White base
+            # Make edges black
+            edge_pixels = (edge_mask > 0) & non_transparent
+            result[edge_pixels, 0:3] = [0, 0, 0]
         else:
-            result[edge_mask, 0:3] = [255, 255, 255]  # White edges on black
+            result[non_transparent, 0:3] = [0, 0, 0]  # Black base
+            # Make edges white
+            edge_pixels = (edge_mask > 0) & non_transparent
+            result[edge_pixels, 0:3] = [255, 255, 255]
         
-        # Apply original alpha channel
-        result[:, :, 3] = alpha_array
+        # Apply original alpha
+        result[:, :, 3] = alpha
         
         # Create final image
         result_img = Image.fromarray(result, 'RGBA')
         
-        # Save
         output = BytesIO()
         result_img.save(output, format='PNG')
         output.seek(0)
         
-        return send_file(
+        # Debug info
+        edge_pixel_count = np.sum(edge_pixels)
+        total_opaque = np.sum(non_transparent)
+        
+        response = send_file(
             output,
             mimetype='image/png',
             as_attachment=True,
-            download_name=f'solid_{base_color}_readable.png'
+            download_name=f'readable_{base_color}.png'
         )
+        
+        response.headers['X-Edge-Pixels'] = str(edge_pixel_count)
+        response.headers['X-Total-Opaque-Pixels'] = str(total_opaque)
+        response.headers['X-Edge-Percentage'] = f"{(edge_pixel_count/total_opaque*100):.2f}%"
+        
+        return response
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+@app.route('/smart-solid-conversion', methods=['POST'])
+def smart_solid_conversion():
+    """
+    Intelligently convert multi-color logo to solid color
+    Darker colors become strokes, lighter colors become fill
+    
+    Parameters:
+    - image: file (required)
+    - output_color: 'black' or 'white' (default: 'white')
+    - invert_logic: 'true' or 'false' (default: 'false')
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        output_color = request.form.get('output_color', 'white').lower()
+        invert_logic = request.form.get('invert_logic', 'false').lower() == 'true'
+        
+        # Open image
+        img = Image.open(file.stream).convert('RGBA')
+        rgb = np.array(img.convert('RGB'))
+        alpha = np.array(img.split()[3])
+        
+        # Calculate luminance (brightness) for each pixel
+        luminance = 0.299 * rgb[:,:,0] + 0.587 * rgb[:,:,1] + 0.114 * rgb[:,:,2]
+        
+        # Non-transparent pixels only
+        non_transparent = alpha > 0
+        
+        # Find threshold - use mean luminance of non-transparent pixels
+        if np.any(non_transparent):
+            threshold = np.mean(luminance[non_transparent])
+        else:
+            threshold = 127
+        
+        # Classify pixels as "dark" (strokes) or "light" (fill)
+        if invert_logic:
+            is_stroke = (luminance > threshold) & non_transparent
+        else:
+            is_stroke = (luminance < threshold) & non_transparent
+        
+        # Create result
+        result = np.zeros((img.height, img.width, 4), dtype=np.uint8)
+        
+        if output_color == 'white':
+            # White fill, black strokes
+            result[non_transparent, 0:3] = [255, 255, 255]
+            result[is_stroke, 0:3] = [0, 0, 0]
+        else:
+            # Black fill, white strokes
+            result[non_transparent, 0:3] = [0, 0, 0]
+            result[is_stroke, 0:3] = [255, 255, 255]
+        
+        # Apply alpha
+        result[:, :, 3] = alpha
+        
+        result_img = Image.fromarray(result, 'RGBA')
+        
+        output = BytesIO()
+        result_img.save(output, format='PNG')
+        output.seek(0)
+        
+        stroke_pixels = np.sum(is_stroke)
+        fill_pixels = np.sum(non_transparent) - stroke_pixels
+        
+        response = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name=f'smart_{output_color}.png'
+        )
+        
+        response.headers['X-Stroke-Pixels'] = str(stroke_pixels)
+        response.headers['X-Fill-Pixels'] = str(fill_pixels)
+        response.headers['X-Luminance-Threshold'] = f"{threshold:.2f}"
+        
+        return response
         
     except Exception as e:
         import traceback
