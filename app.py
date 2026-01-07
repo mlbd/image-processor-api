@@ -110,9 +110,7 @@ def admin():
 def force_solid_black():
     """
     Convert ANY logo to solid black while PRESERVING transparency
-    - Only affects non-transparent pixels
-    - Transparent areas stay 100% transparent
-    - Perfect for silhouettes on any background
+    Ultra-safe version that guarantees transparent pixels stay transparent
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -127,33 +125,46 @@ def force_solid_black():
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
         
-        # Open image and ensure RGBA mode
-        img = Image.open(file.stream).convert('RGBA')
-        data = np.array(img)
+        # Open image - force RGBA mode
+        img = Image.open(file.stream)
         
-        # Extract RGBA channels
-        r, g, b, alpha = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
+        # Ensure we have an alpha channel
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
         
-        # Create mask for non-transparent pixels only
-        non_transparent_mask = alpha > 0
+        # Get the data as numpy array
+        data = np.array(img, dtype=np.uint8)
         
-        # Make only non-transparent pixels black
-        # Keep RGB as is for transparent pixels
-        data[non_transparent_mask, 0] = 0    # Red = 0
-        data[non_transparent_mask, 1] = 0    # Green = 0
-        data[non_transparent_mask, 2] = 0    # Blue = 0
-        # Alpha channel is NOT modified at all
+        # Split into separate channels
+        r = data[:, :, 0]
+        g = data[:, :, 1]
+        b = data[:, :, 2]
+        alpha = data[:, :, 3]
         
-        result_img = Image.fromarray(data, 'RGBA')
+        # Create new array with same shape
+        result = np.zeros_like(data)
         
+        # Set RGB to black for all pixels
+        result[:, :, 0] = 0  # R
+        result[:, :, 1] = 0  # G
+        result[:, :, 2] = 0  # B
+        
+        # CRITICAL: Copy original alpha channel exactly as-is
+        result[:, :, 3] = alpha
+        
+        # Create image from array
+        result_img = Image.fromarray(result, mode='RGBA')
+        
+        # Save as PNG with transparency
         output = BytesIO()
-        result_img.save(output, format='PNG')
+        result_img.save(output, format='PNG', optimize=False)
         output.seek(0)
         
-        # Calculate stats
-        non_transparent_pixels = np.sum(non_transparent_mask)
-        transparent_pixels = np.sum(alpha == 0)
+        # Stats
         total_pixels = alpha.size
+        transparent_pixels = np.sum(alpha == 0)
+        semi_transparent = np.sum((alpha > 0) & (alpha < 255))
+        fully_opaque = np.sum(alpha == 255)
         
         response = send_file(
             output,
@@ -162,18 +173,20 @@ def force_solid_black():
             download_name='solid_black.png'
         )
         
-        response.headers['X-Pixels-Changed'] = str(non_transparent_pixels)
-        response.headers['X-Transparent-Pixels'] = str(transparent_pixels)
         response.headers['X-Total-Pixels'] = str(total_pixels)
+        response.headers['X-Transparent-Pixels'] = str(transparent_pixels)
+        response.headers['X-Semi-Transparent-Pixels'] = str(semi_transparent)
+        response.headers['X-Opaque-Pixels'] = str(fully_opaque)
         response.headers['X-Output-Color'] = 'BLACK'
-        response.headers['X-Transparency-Preserved'] = 'YES'
         
         return response
         
     except Exception as e:
+        import traceback
         return jsonify({
             "error": "Processing failed",
-            "details": str(e)
+            "details": str(e),
+            "traceback": traceback.format_exc()
         }), 500
 
 
@@ -181,9 +194,7 @@ def force_solid_black():
 def force_solid_white():
     """
     Convert ANY logo to solid white while PRESERVING transparency
-    - Only affects non-transparent pixels
-    - Transparent areas stay 100% transparent
-    - Perfect for white logos on dark backgrounds
+    Ultra-safe version that guarantees transparent pixels stay transparent
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -198,33 +209,46 @@ def force_solid_white():
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
         
-        # Open image and ensure RGBA mode
-        img = Image.open(file.stream).convert('RGBA')
-        data = np.array(img)
+        # Open image - force RGBA mode
+        img = Image.open(file.stream)
         
-        # Extract RGBA channels
-        r, g, b, alpha = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
+        # Ensure we have an alpha channel
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
         
-        # Create mask for non-transparent pixels only
-        non_transparent_mask = alpha > 0
+        # Get the data as numpy array
+        data = np.array(img, dtype=np.uint8)
         
-        # Make only non-transparent pixels white
-        # Keep RGB as is for transparent pixels
-        data[non_transparent_mask, 0] = 255  # Red = 255
-        data[non_transparent_mask, 1] = 255  # Green = 255
-        data[non_transparent_mask, 2] = 255  # Blue = 255
-        # Alpha channel is NOT modified at all
+        # Split into separate channels
+        r = data[:, :, 0]
+        g = data[:, :, 1]
+        b = data[:, :, 2]
+        alpha = data[:, :, 3]
         
-        result_img = Image.fromarray(data, 'RGBA')
+        # Create new array with same shape
+        result = np.zeros_like(data)
         
+        # Set RGB to white for all pixels
+        result[:, :, 0] = 255  # R
+        result[:, :, 1] = 255  # G
+        result[:, :, 2] = 255  # B
+        
+        # CRITICAL: Copy original alpha channel exactly as-is
+        result[:, :, 3] = alpha
+        
+        # Create image from array
+        result_img = Image.fromarray(result, mode='RGBA')
+        
+        # Save as PNG with transparency
         output = BytesIO()
-        result_img.save(output, format='PNG')
+        result_img.save(output, format='PNG', optimize=False)
         output.seek(0)
         
-        # Calculate stats
-        non_transparent_pixels = np.sum(non_transparent_mask)
-        transparent_pixels = np.sum(alpha == 0)
+        # Stats
         total_pixels = alpha.size
+        transparent_pixels = np.sum(alpha == 0)
+        semi_transparent = np.sum((alpha > 0) & (alpha < 255))
+        fully_opaque = np.sum(alpha == 255)
         
         response = send_file(
             output,
@@ -233,19 +257,58 @@ def force_solid_white():
             download_name='solid_white.png'
         )
         
-        response.headers['X-Pixels-Changed'] = str(non_transparent_pixels)
-        response.headers['X-Transparent-Pixels'] = str(transparent_pixels)
         response.headers['X-Total-Pixels'] = str(total_pixels)
+        response.headers['X-Transparent-Pixels'] = str(transparent_pixels)
+        response.headers['X-Semi-Transparent-Pixels'] = str(semi_transparent)
+        response.headers['X-Opaque-Pixels'] = str(fully_opaque)
         response.headers['X-Output-Color'] = 'WHITE'
-        response.headers['X-Transparency-Preserved'] = 'YES'
         
         return response
         
     except Exception as e:
+        import traceback
         return jsonify({
             "error": "Processing failed",
-            "details": str(e)
+            "details": str(e),
+            "traceback": traceback.format_exc()
         }), 500
+
+@app.route('/check-transparency', methods=['POST'])
+def check_transparency():
+    """Check transparency information of uploaded image"""
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        img = Image.open(file.stream)
+        
+        original_mode = img.mode
+        
+        if img.mode != 'RGBA':
+            img = img.convert('RGBA')
+        
+        data = np.array(img)
+        alpha = data[:, :, 3]
+        
+        return jsonify({
+            "original_mode": original_mode,
+            "converted_mode": "RGBA",
+            "dimensions": f"{img.width}x{img.height}",
+            "total_pixels": int(alpha.size),
+            "transparency_info": {
+                "fully_transparent": int(np.sum(alpha == 0)),
+                "semi_transparent": int(np.sum((alpha > 0) & (alpha < 255))),
+                "fully_opaque": int(np.sum(alpha == 255))
+            },
+            "has_transparency": bool(np.any(alpha < 255)),
+            "min_alpha": int(np.min(alpha)),
+            "max_alpha": int(np.max(alpha)),
+            "avg_alpha": float(np.mean(alpha))
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
         
 @app.route('/debug-smart-color', methods=['POST'])
 def debug_smart_color():
