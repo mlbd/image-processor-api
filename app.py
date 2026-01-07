@@ -112,6 +112,137 @@ def admin():
         "next_nap_in": "Not today, Satan! ☕"
     })
 
+@app.route('/smart-color-replace', methods=['POST'])
+def smart_color_replace():
+    """
+    Automatically detect and replace the main SOLID color (dark or light)
+    - Ignores gradients and multi-color areas
+    - Only replaces uniform/solid colored regions
+    - Can target either dark colors or light colors
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        # Parameters
+        new_hue = int(request.form.get('new_hue', 0))  # Target color to replace with
+        target_type = request.form.get('target_type', 'dark').lower()  # 'dark' or 'light'
+        
+        file = request.files['image']
+        img = Image.open(file.stream).convert('RGBA')
+        
+        rgb = img.convert('RGB')
+        alpha = img.split()[3] if img.mode == 'RGBA' else None
+        rgb_array = np.array(rgb)
+        
+        # Convert to HSV
+        hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV).astype(np.float32)
+        h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+        
+        # Step 1: Filter for solid colors only (ignore gradients)
+        # Check local variance - solid areas have low variance
+        kernel_size = 5
+        
+        # Calculate local variance for each channel
+        h_variance = cv2.blur(h**2, (kernel_size, kernel_size)) - cv2.blur(h, (kernel_size, kernel_size))**2
+        s_variance = cv2.blur(s**2, (kernel_size, kernel_size)) - cv2.blur(s, (kernel_size, kernel_size))**2
+        v_variance = cv2.blur(v**2, (kernel_size, kernel_size)) - cv2.blur(v, (kernel_size, kernel_size))**2
+        
+        # Total variance - low values = solid color area
+        total_variance = h_variance + s_variance + v_variance
+        
+        # Solid color mask (low variance areas)
+        variance_threshold = 100  # Adjust this for strictness (lower = more strict)
+        solid_mask = total_variance < variance_threshold
+        
+        # Step 2: Filter by saturation (colored pixels only, not grays)
+        saturation_threshold = 30
+        colored_mask = s > saturation_threshold
+        
+        # Step 3: Filter by brightness (dark or light)
+        if target_type == 'light':
+            # Light/whitish colors (high brightness)
+            brightness_mask = v > 150  # Bright pixels
+        else:
+            # Dark colors (low brightness)
+            brightness_mask = v < 120  # Dark pixels
+        
+        # Combine all masks
+        target_mask = solid_mask & colored_mask & brightness_mask
+        
+        # Check if we found any valid pixels
+        if not np.any(target_mask):
+            return jsonify({
+                "error": f"No solid {target_type} colored areas found in the image",
+                "suggestion": f"Try changing 'target_type' to '{'light' if target_type == 'dark' else 'dark'}'"
+            }), 400
+        
+        # Step 4: Find the dominant hue among valid pixels
+        valid_hues = h[target_mask]
+        
+        # Use histogram to find most common hue
+        hist, bin_edges = np.histogram(valid_hues, bins=36, range=(0, 180))
+        dominant_hue_bin = np.argmax(hist)
+        dominant_hue = (bin_edges[dominant_hue_bin] + bin_edges[dominant_hue_bin + 1]) / 2
+        
+        # Step 5: Create final mask for pixels similar to dominant hue
+        hue_tolerance = 20  # How similar colors should be to get replaced
+        
+        # Find pixels matching dominant hue
+        hue_diff = np.abs(h - dominant_hue)
+        # Handle hue wrap-around (0° and 180° are close)
+        hue_diff = np.minimum(hue_diff, 180 - hue_diff)
+        
+        hue_match_mask = hue_diff < hue_tolerance
+        
+        # Final mask: solid + colored + right brightness + matching hue
+        final_mask = target_mask & hue_match_mask
+        
+        # Step 6: Replace hue ONLY (preserve saturation and value for natural look)
+        hsv[:,:,0][final_mask] = new_hue / 2  # Convert to OpenCV range (0-180)
+        
+        # Step 7: Convert back to RGB
+        result_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        result_img = Image.fromarray(result_rgb, 'RGB')
+        
+        # Reapply alpha channel
+        if alpha:
+            result_img.putalpha(alpha)
+        
+        # Return result with metadata
+        output = BytesIO()
+        result_img.save(output, format='PNG')
+        output.seek(0)
+        
+        # Calculate some stats for debugging
+        total_pixels = h.size
+        replaced_pixels = np.sum(final_mask)
+        percentage = (replaced_pixels / total_pixels) * 100
+        
+        response = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name=f'smart_replaced_{target_type}.png'
+        )
+        
+        # Add metadata headers
+        response.headers['X-Detected-Hue'] = str(int(dominant_hue * 2))
+        response.headers['X-Pixels-Changed'] = str(replaced_pixels)
+        response.headers['X-Change-Percentage'] = f"{percentage:.2f}%"
+        
+        return response
+        
+    except Exception as e:
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e)
+        }), 500
+        
 @app.route('/replace-dark-to-white', methods=['POST'])
 def replace_dark():
     """Replace dark colors with white (for making logos visible on dark backgrounds)"""
@@ -161,6 +292,89 @@ def replace_dark():
             "details": str(e)
         }), 500
 
+@app.route('/replace-color-pro', methods=['POST'])
+def replace_color_professional():
+    """Professional color replacement - preserves quality, gradients, shadows"""
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        # Get parameters
+        target_hue = int(request.form.get('target_hue', 210))  # Blue default
+        new_hue = int(request.form.get('new_hue', 0))          # Red default
+        hue_tolerance = int(request.form.get('hue_tolerance', 30))
+        
+        file = request.files['image']
+        img = Image.open(file.stream).convert('RGBA')
+        
+        # Separate alpha channel
+        rgb = img.convert('RGB')
+        alpha = img.split()[3] if img.mode == 'RGBA' else None
+        
+        # Convert to numpy array
+        rgb_array = np.array(rgb)
+        
+        # Convert RGB to HSV (this is the magic!)
+        hsv = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2HSV).astype(np.float32)
+        
+        # Extract H, S, V channels
+        h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
+        
+        # Create mask for target color
+        # Handle hue wrap-around (hue is 0-180 in OpenCV)
+        target_hue_cv = target_hue / 2  # Convert to OpenCV range
+        tolerance_cv = hue_tolerance / 2
+        
+        # Find pixels within hue range
+        lower_bound = target_hue_cv - tolerance_cv
+        upper_bound = target_hue_cv + tolerance_cv
+        
+        if lower_bound < 0:
+            mask = ((h >= 180 + lower_bound) | (h <= upper_bound))
+        elif upper_bound > 180:
+            mask = ((h >= lower_bound) | (h <= upper_bound - 180))
+        else:
+            mask = ((h >= lower_bound) & (h <= upper_bound))
+        
+        # Also consider saturation (ignore very desaturated/gray pixels)
+        mask = mask & (s > 30)  # Only change colored pixels, not grays
+        
+        # Replace hue ONLY (keep saturation and value!)
+        h[mask] = new_hue / 2  # Convert to OpenCV range
+        
+        # Reconstruct HSV
+        hsv[:,:,0] = h
+        # s and v remain unchanged!
+        
+        # Convert back to RGB
+        result_rgb = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+        
+        # Convert to PIL Image
+        result_img = Image.fromarray(result_rgb, 'RGB')
+        
+        # Reapply alpha channel if existed
+        if alpha:
+            result_img.putalpha(alpha)
+        
+        # Save and return
+        output = BytesIO()
+        result_img.save(output, format='PNG')
+        output.seek(0)
+        
+        return send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name='color_replaced_pro.png'
+        )
+        
+    except Exception as e:
+        return jsonify({"error": "Processing failed", "details": str(e)}), 500
+        
 @app.route('/replace-color', methods=['POST'])
 def replace_specific_color():
     """Replace a specific color with another color"""
