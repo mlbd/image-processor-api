@@ -108,15 +108,19 @@ def admin():
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
     """
-    🎯 ULTIMATE PRINT-READY CONVERSION v2
+    🎯 ULTIMATE PRINT-READY CONVERSION v3
     
-    Uses COLOR + LUMINANCE separation to preserve borders.
-    Separates: Achromatic Dark (borders) vs Chromatic (fills) vs Achromatic Light
+    Converts ALL colors to shades of the target print_color.
+    - Fill = 100% print_color
+    - Borders = graduated shades (90%, 80%, 70%... of print_color)
+    
+    NO opposite colors remain (no black when white, no white when black)
     
     Parameters:
     - image: file (required)
     - print_color: 'white' or 'black' (required)
-    - border_contrast: 'auto', 'high', 'medium' (default: 'auto')
+    - layers: 2-5 (default: 'auto' - detects from image)
+    - contrast_step: 10-30 (default: 15) - percentage difference between layers
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -128,13 +132,17 @@ def smart_print_ready():
         
         file = request.files['image']
         print_color = request.form.get('print_color', '').lower()
-        border_contrast = request.form.get('border_contrast', 'auto').lower()
+        num_layers = request.form.get('layers', 'auto').lower()
+        contrast_step = int(request.form.get('contrast_step', 15))
         
         if print_color not in ['white', 'black']:
             return jsonify({
                 "error": "print_color is required",
                 "usage": "print_color=white (for dark shirts) or print_color=black (for light shirts)"
             }), 400
+        
+        # Clamp contrast_step
+        contrast_step = max(10, min(30, contrast_step))
         
         # Load image
         img = Image.open(file.stream).convert('RGBA')
@@ -145,40 +153,47 @@ def smart_print_ready():
         original_alpha = a.copy()
         
         # ============================================================
-        # STEP 1: REMOVE BACKGROUND
+        # STEP 1: DETECT AND REMOVE BACKGROUND
         # ============================================================
         
-        # Analyze corners
         corner_positions = [
             (0, 0), (0, width-1), (height-1, 0), (height-1, width-1),
-            (0, width//2), (height-1, width//2)
+            (0, width//4), (0, width*3//4),
+            (height-1, width//4), (height-1, width*3//4),
+            (height//4, 0), (height*3//4, 0),
+            (height//4, width-1), (height*3//4, width-1)
         ]
         
-        corner_colors = [data[y, x, :3] for y, x in corner_positions]
-        corner_alphas = [data[y, x, 3] for y, x in corner_positions]
+        corner_colors = []
+        corner_alphas = []
+        for y, x in corner_positions:
+            if 0 <= y < height and 0 <= x < width:
+                corner_colors.append(data[y, x, :3])
+                corner_alphas.append(data[y, x, 3])
+        
         avg_corner = np.mean(corner_colors, axis=0)
         avg_alpha = np.mean(corner_alphas)
         
-        # Detect background
+        # Detect background type
         if avg_alpha < 128:
             bg_type = "transparent"
             bg_mask = original_alpha < 128
-        elif np.mean(avg_corner) > 240:
+        elif np.mean(avg_corner) > 235:
             bg_type = "white"
             color_diff = np.sqrt(
                 (r.astype(np.float32) - 255)**2 +
                 (g.astype(np.float32) - 255)**2 +
                 (b.astype(np.float32) - 255)**2
             )
-            bg_mask = color_diff < 35
-        elif np.mean(avg_corner) < 20:
+            bg_mask = color_diff < 40
+        elif np.mean(avg_corner) < 25:
             bg_type = "black"
             color_diff = np.sqrt(
                 r.astype(np.float32)**2 +
                 g.astype(np.float32)**2 +
                 b.astype(np.float32)**2
             )
-            bg_mask = color_diff < 35
+            bg_mask = color_diff < 40
         else:
             bg_type = "colored"
             color_diff = np.sqrt(
@@ -186,77 +201,138 @@ def smart_print_ready():
                 (g.astype(np.float32) - avg_corner[1])**2 +
                 (b.astype(np.float32) - avg_corner[2])**2
             )
-            bg_mask = color_diff < 45
+            bg_mask = color_diff < 50
         
+        # Include already transparent pixels
         bg_mask = bg_mask | (original_alpha < 128)
         
-        # Clean up background mask
-        kernel = np.ones((3, 3), np.uint8)
+        # Clean up background mask with morphology
+        kernel = np.ones((5, 5), np.uint8)
         bg_mask_uint8 = bg_mask.astype(np.uint8) * 255
         bg_mask_uint8 = cv2.morphologyEx(bg_mask_uint8, cv2.MORPH_CLOSE, kernel)
-        bg_mask = bg_mask_uint8 > 127
         
-        logo_mask = ~bg_mask
+        # Flood fill from corners to ensure connected background
+        flood_mask = np.zeros((height + 2, width + 2), np.uint8)
+        bg_flood = bg_mask_uint8.copy()
+        
+        # Flood from corners
+        for y, x in [(0, 0), (0, width-1), (height-1, 0), (height-1, width-1)]:
+            if bg_mask_uint8[y, x] > 127:
+                cv2.floodFill(bg_flood, flood_mask, (x, y), 255)
+        
+        bg_mask = bg_flood > 127
+        
+        logo_mask = ~bg_mask & (original_alpha > 0)
         
         if not np.any(logo_mask):
-            return jsonify({"error": "No logo found after background removal"}), 400
+            return jsonify({"error": "No logo content found after background removal"}), 400
         
         # ============================================================
-        # STEP 2: CONVERT TO HSV FOR COLOR ANALYSIS
+        # STEP 2: CALCULATE LUMINANCE FOR ALL LOGO PIXELS
         # ============================================================
         
-        # Convert to HSV
-        rgb_img = data[:, :, :3]
-        hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
-        h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
-        
-        # Calculate luminance
         luminance = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
         
-        # ============================================================
-        # STEP 3: CLASSIFY PIXELS INTO CATEGORIES
-        # ============================================================
-        
-        # Thresholds
-        saturation_threshold = 30  # Below this = achromatic (black/white/gray)
-        dark_threshold = 60        # Below this luminance = dark
-        light_threshold = 200      # Above this luminance = light
-        
-        # Create masks for each category
-        is_chromatic = (s > saturation_threshold) & logo_mask  # Has color (like red)
-        is_achromatic = (s <= saturation_threshold) & logo_mask  # No color (black/white/gray)
-        
-        is_achromatic_dark = is_achromatic & (luminance < dark_threshold)   # Black borders
-        is_achromatic_light = is_achromatic & (luminance >= light_threshold)  # White areas
-        is_achromatic_mid = is_achromatic & (luminance >= dark_threshold) & (luminance < light_threshold)  # Gray
-        
-        # For chromatic pixels, also separate by brightness
-        is_chromatic_dark = is_chromatic & (v < 100)  # Dark colored
-        is_chromatic_light = is_chromatic & (v >= 100)  # Normal/bright colored
+        # Get luminance values for logo pixels only
+        logo_luminance = luminance[logo_mask]
         
         # ============================================================
-        # STEP 4: ANALYZE WHAT WE FOUND
+        # STEP 3: DETERMINE NUMBER OF LAYERS
         # ============================================================
         
-        achromatic_dark_count = np.sum(is_achromatic_dark)
-        achromatic_light_count = np.sum(is_achromatic_light)
-        chromatic_count = np.sum(is_chromatic)
+        lum_min = np.min(logo_luminance)
+        lum_max = np.max(logo_luminance)
+        lum_range = lum_max - lum_min
+        lum_std = np.std(logo_luminance)
         
-        # Detect if logo has distinct borders
-        has_dark_borders = achromatic_dark_count > (np.sum(logo_mask) * 0.05)  # >5% dark achromatic
-        has_colored_fills = chromatic_count > (np.sum(logo_mask) * 0.1)  # >10% chromatic
+        if num_layers == 'auto':
+            # Analyze histogram to find natural clusters
+            hist, bins = np.histogram(logo_luminance, bins=32)
+            
+            # Find significant peaks
+            threshold = np.max(hist) * 0.1
+            peaks = 0
+            in_peak = False
+            for count in hist:
+                if count > threshold and not in_peak:
+                    peaks += 1
+                    in_peak = True
+                elif count <= threshold:
+                    in_peak = False
+            
+            optimal_layers = max(2, min(5, peaks))
+            
+            # Also consider luminance range
+            if lum_range < 50:
+                optimal_layers = 2
+            elif lum_range < 100:
+                optimal_layers = min(optimal_layers, 3)
+        else:
+            try:
+                optimal_layers = int(num_layers)
+                optimal_layers = max(2, min(5, optimal_layers))
+            except:
+                optimal_layers = 3
         
         # ============================================================
-        # STEP 5: DETERMINE COLOR MAPPING
+        # STEP 4: K-MEANS CLUSTERING ON LUMINANCE
         # ============================================================
         
-        # Define contrast levels
-        if border_contrast == 'high':
-            fill_contrast_color = [128, 128, 128]  # Gray fill when border is main color
-        elif border_contrast == 'medium':
-            fill_contrast_color = [180, 180, 180]  # Light gray
-        else:  # auto
-            fill_contrast_color = [160, 160, 160]  # Medium-light gray
+        logo_lum_flat = logo_luminance.reshape(-1, 1).astype(np.float32)
+        
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+        _, labels, centers = cv2.kmeans(
+            logo_lum_flat,
+            optimal_layers,
+            None,
+            criteria,
+            10,
+            cv2.KMEANS_PP_CENTERS
+        )
+        
+        # Sort centers by luminance
+        center_values = centers.flatten()
+        center_order = np.argsort(center_values)  # Darkest to lightest
+        
+        # Create mapping: original label -> sorted rank (0=darkest, n=lightest)
+        label_to_rank = {old_label: rank for rank, old_label in enumerate(center_order)}
+        
+        # ============================================================
+        # STEP 5: GENERATE OUTPUT COLORS
+        # ============================================================
+        
+        # Generate graduated shades based on print_color
+        output_colors = []
+        
+        if print_color == 'white':
+            # All shades of white (lightest = fill, darker = borders)
+            # Layer 0 (darkest original) → lightest shade (most contrast from fill)
+            # Layer n (lightest original) → 100% white (fill)
+            
+            for i in range(optimal_layers):
+                # Reverse: darkest original becomes the "outer" shade
+                shade_index = optimal_layers - 1 - i
+                darkness = shade_index * contrast_step  # 0%, 15%, 30%...
+                gray_value = int(255 - (255 * darkness / 100))
+                gray_value = max(180, gray_value)  # Never darker than rgb(180,180,180)
+                output_colors.append([gray_value, gray_value, gray_value])
+            
+            # Ensure the lightest (fill) is pure white
+            output_colors[-1] = [255, 255, 255]
+            
+        else:  # print_color == 'black'
+            # All shades of black (darkest = fill, lighter = borders)
+            # Layer 0 (darkest original) → 100% black (fill)
+            # Layer n (lightest original) → lightest shade
+            
+            for i in range(optimal_layers):
+                lightness = i * contrast_step  # 0%, 15%, 30%...
+                gray_value = int(255 * lightness / 100)
+                gray_value = min(75, gray_value)  # Never lighter than rgb(75,75,75)
+                output_colors.append([gray_value, gray_value, gray_value])
+            
+            # Ensure the darkest (fill) is pure black
+            output_colors[0] = [0, 0, 0]
         
         # ============================================================
         # STEP 6: BUILD OUTPUT IMAGE
@@ -264,54 +340,38 @@ def smart_print_ready():
         
         result = np.zeros((height, width, 4), dtype=np.uint8)
         
-        # Background = transparent
+        # Background = fully transparent
         result[bg_mask] = [0, 0, 0, 0]
         
-        if print_color == 'white':
-            # FOR DARK SHIRTS (white print):
-            # - Black borders → BLACK (will be subtle on dark shirt, creates depth)
-            # - Colored fills (red) → WHITE (printed, visible)
-            # - White areas → WHITE
-            # - Gray areas → WHITE
-            # - Dark chromatic → Darker shade
-            
-            if has_dark_borders and has_colored_fills:
-                # Logo HAS borders - preserve them!
-                result[is_achromatic_dark] = [0, 0, 0, 255]        # Black borders stay BLACK
-                result[is_chromatic] = [255, 255, 255, 255]        # Colored fills → WHITE
-                result[is_achromatic_light] = [255, 255, 255, 255] # White → WHITE
-                result[is_achromatic_mid] = [200, 200, 200, 255]   # Gray → Light gray
-            else:
-                # Simple logo without distinct borders
-                result[is_achromatic_dark] = [255, 255, 255, 255]  # Dark → WHITE
-                result[is_chromatic] = [255, 255, 255, 255]        # Colored → WHITE
-                result[is_achromatic_light] = [255, 255, 255, 255] # Light → WHITE
-                result[is_achromatic_mid] = [255, 255, 255, 255]   # Gray → WHITE
+        # Map each logo pixel to its output color
+        logo_indices = np.where(logo_mask)
+        logo_y = logo_indices[0]
+        logo_x = logo_indices[1]
         
-        else:  # print_color == 'black'
-            # FOR LIGHT SHIRTS (black print):
-            # - Black borders → BLACK (printed, visible)
-            # - Colored fills (red) → GRAY (contrast with black border)
-            # - White areas → WHITE (blends with shirt) or LIGHT GRAY
-            # - Gray areas → Appropriate gray
+        for i, (y, x) in enumerate(zip(logo_y, logo_x)):
+            original_label = labels[i][0]
+            rank = label_to_rank[original_label]  # 0=darkest, n-1=lightest
             
-            if has_dark_borders and has_colored_fills:
-                # Logo HAS borders - preserve them with contrast!
-                result[is_achromatic_dark] = [0, 0, 0, 255]           # Black borders → BLACK
-                result[is_chromatic] = [fill_contrast_color[0], 
-                                        fill_contrast_color[1], 
-                                        fill_contrast_color[2], 255]  # Colored fills → GRAY
-                result[is_achromatic_light] = [255, 255, 255, 255]    # White → WHITE
-                result[is_achromatic_mid] = [180, 180, 180, 255]      # Gray → Light gray
-            else:
-                # Simple logo without distinct borders
-                result[is_achromatic_dark] = [0, 0, 0, 255]          # Dark → BLACK
-                result[is_chromatic] = [0, 0, 0, 255]                # Colored → BLACK
-                result[is_achromatic_light] = [255, 255, 255, 255]   # Light → WHITE (blend)
-                result[is_achromatic_mid] = [80, 80, 80, 255]        # Gray → Dark gray
+            color = output_colors[rank]
+            result[y, x] = [color[0], color[1], color[2], 255]
         
         # ============================================================
-        # STEP 7: OUTPUT
+        # STEP 7: PRESERVE ANTI-ALIASING ON EDGES
+        # ============================================================
+        
+        # Find edge pixels (where alpha was partial in original or at logo boundary)
+        logo_mask_uint8 = logo_mask.astype(np.uint8) * 255
+        edges = cv2.Canny(logo_mask_uint8, 100, 200)
+        edge_dilated = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
+        edge_mask = edge_dilated > 0
+        
+        # Apply original partial transparency to edges for smoother look
+        edge_pixels = edge_mask & logo_mask
+        # Keep full opacity but could soften if needed:
+        # result[edge_pixels, 3] = np.minimum(result[edge_pixels, 3], original_alpha[edge_pixels])
+        
+        # ============================================================
+        # STEP 8: OUTPUT
         # ============================================================
         
         result_img = Image.fromarray(result, 'RGBA')
@@ -320,6 +380,17 @@ def smart_print_ready():
         result_img.save(output, format='PNG', optimize=True)
         output.seek(0)
         
+        # Calculate stats for each layer
+        layer_stats = {}
+        for rank in range(optimal_layers):
+            count = sum(1 for i in range(len(labels)) if label_to_rank[labels[i][0]] == rank)
+            layer_stats[f"layer_{rank}"] = {
+                "pixels": count,
+                "output_color": output_colors[rank],
+                "role": "fill" if (print_color == 'white' and rank == optimal_layers-1) or 
+                                 (print_color == 'black' and rank == 0) else "border/detail"
+            }
+        
         response = send_file(
             output,
             mimetype='image/png',
@@ -327,14 +398,14 @@ def smart_print_ready():
             download_name=f'print_ready_{print_color}.png'
         )
         
-        # Debug headers
         response.headers['X-Print-Color'] = print_color.upper()
         response.headers['X-Background-Type'] = bg_type
-        response.headers['X-Has-Dark-Borders'] = str(has_dark_borders)
-        response.headers['X-Has-Colored-Fills'] = str(has_colored_fills)
-        response.headers['X-Achromatic-Dark-Pixels'] = str(achromatic_dark_count)
-        response.headers['X-Chromatic-Pixels'] = str(chromatic_count)
-        response.headers['X-Logo-Pixels'] = str(int(np.sum(logo_mask)))
+        response.headers['X-Layers-Used'] = str(optimal_layers)
+        response.headers['X-Contrast-Step'] = f"{contrast_step}%"
+        response.headers['X-Luminance-Range'] = f"{lum_min:.0f}-{lum_max:.0f}"
+        response.headers['X-Output-Colors'] = str(output_colors)
+        response.headers['X-Logo-Pixels'] = str(len(logo_y))
+        response.headers['X-BG-Pixels-Removed'] = str(int(np.sum(bg_mask)))
         
         return response
         
@@ -350,7 +421,7 @@ def smart_print_ready():
 @app.route('/smart-print-ready/analyze', methods=['POST'])
 def smart_print_ready_analyze():
     """
-    Analyze logo - shows detected borders, fills, and recommendations
+    Analyze logo - shows detected layers and expected output colors
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -361,6 +432,7 @@ def smart_print_ready_analyze():
             return jsonify({"error": "No image file provided"}), 400
         
         file = request.files['image']
+        contrast_step = int(request.form.get('contrast_step', 15))
         
         img = Image.open(file.stream).convert('RGBA')
         data = np.array(img)
@@ -368,71 +440,66 @@ def smart_print_ready_analyze():
         
         r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
         
-        # Background detection
-        corners = [data[0,0,:3], data[0,-1,:3], data[-1,0,:3], data[-1,-1,:3]]
-        avg_corner = np.mean(corners, axis=0)
-        avg_alpha = np.mean([data[0,0,3], data[0,-1,3], data[-1,0,3], data[-1,-1,3]])
+        # Simple background detection
+        corners = [data[0,0], data[0,-1], data[-1,0], data[-1,-1]]
+        avg_corner = np.mean([c[:3] for c in corners], axis=0)
+        avg_alpha = np.mean([c[3] for c in corners])
         
         if avg_alpha < 128:
             bg_type = "transparent"
-        elif np.mean(avg_corner) > 240:
+        elif np.mean(avg_corner) > 235:
             bg_type = "white"
-        elif np.mean(avg_corner) < 20:
+        elif np.mean(avg_corner) < 25:
             bg_type = "black"
         else:
             bg_type = "colored"
         
-        # HSV analysis
-        rgb_img = data[:, :, :3]
-        hsv = cv2.cvtColor(rgb_img, cv2.COLOR_RGB2HSV)
-        h, s, v = hsv[:,:,0], hsv[:,:,1], hsv[:,:,2]
-        
-        logo_mask = a > 128
+        # Analyze luminance
         luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        logo_mask = a > 128
         
-        # Classify pixels
-        saturation_threshold = 30
-        dark_threshold = 60
-        light_threshold = 200
+        if not np.any(logo_mask):
+            return jsonify({"error": "No logo content found"}), 400
         
-        is_chromatic = (s > saturation_threshold) & logo_mask
-        is_achromatic = (s <= saturation_threshold) & logo_mask
-        is_achromatic_dark = is_achromatic & (luminance < dark_threshold)
-        is_achromatic_light = is_achromatic & (luminance >= light_threshold)
+        logo_lum = luminance[logo_mask]
+        lum_min, lum_max = float(np.min(logo_lum)), float(np.max(logo_lum))
+        lum_std = float(np.std(logo_lum))
+        lum_range = lum_max - lum_min
         
-        total_logo = np.sum(logo_mask)
-        achromatic_dark_count = int(np.sum(is_achromatic_dark))
-        achromatic_light_count = int(np.sum(is_achromatic_light))
-        chromatic_count = int(np.sum(is_chromatic))
+        # Estimate layers
+        hist, bins = np.histogram(logo_lum, bins=32)
+        threshold = np.max(hist) * 0.1
+        peaks = 0
+        in_peak = False
+        for count in hist:
+            if count > threshold and not in_peak:
+                peaks += 1
+                in_peak = True
+            elif count <= threshold:
+                in_peak = False
         
-        has_borders = achromatic_dark_count > (total_logo * 0.05)
-        has_fills = chromatic_count > (total_logo * 0.1)
+        optimal_layers = max(2, min(5, peaks))
+        if lum_range < 50:
+            optimal_layers = 2
         
-        # Detect dominant chromatic color
-        if chromatic_count > 0:
-            chromatic_hues = h[is_chromatic]
-            dominant_hue = np.median(chromatic_hues) * 2  # Convert to 0-360
+        # Generate expected output colors
+        white_colors = []
+        black_colors = []
+        
+        for i in range(optimal_layers):
+            # White print colors
+            shade_index = optimal_layers - 1 - i
+            darkness = shade_index * contrast_step
+            gray = max(180, int(255 - (255 * darkness / 100)))
+            white_colors.append(f"rgb({gray},{gray},{gray})")
             
-            # Map hue to color name
-            if dominant_hue < 15 or dominant_hue > 345:
-                dominant_color = "red"
-            elif dominant_hue < 45:
-                dominant_color = "orange"
-            elif dominant_hue < 75:
-                dominant_color = "yellow"
-            elif dominant_hue < 150:
-                dominant_color = "green"
-            elif dominant_hue < 210:
-                dominant_color = "cyan"
-            elif dominant_hue < 270:
-                dominant_color = "blue"
-            elif dominant_hue < 330:
-                dominant_color = "purple/magenta"
-            else:
-                dominant_color = "red"
-        else:
-            dominant_hue = 0
-            dominant_color = "none (achromatic logo)"
+            # Black print colors
+            lightness = i * contrast_step
+            gray = min(75, int(255 * lightness / 100))
+            black_colors.append(f"rgb({gray},{gray},{gray})")
+        
+        white_colors[-1] = "rgb(255,255,255) [FILL]"
+        black_colors[0] = "rgb(0,0,0) [FILL]"
         
         return jsonify({
             "image": {
@@ -443,39 +510,35 @@ def smart_print_ready_analyze():
                 "type": bg_type,
                 "will_be_removed": True
             },
-            "logo_structure": {
-                "total_logo_pixels": int(total_logo),
-                "achromatic_dark_pixels": achromatic_dark_count,
-                "achromatic_dark_percentage": f"{(achromatic_dark_count/total_logo)*100:.1f}%",
-                "chromatic_pixels": chromatic_count,
-                "chromatic_percentage": f"{(chromatic_count/total_logo)*100:.1f}%",
-                "achromatic_light_pixels": achromatic_light_count
+            "luminance_analysis": {
+                "min": lum_min,
+                "max": lum_max,
+                "range": lum_range,
+                "std_dev": lum_std,
+                "histogram_peaks": peaks
             },
-            "detection": {
-                "has_dark_borders": has_borders,
-                "has_colored_fills": has_fills,
-                "dominant_fill_color": dominant_color,
-                "dominant_hue": float(dominant_hue),
-                "logo_type": "bordered with colored fill" if (has_borders and has_fills) else 
-                            "bordered" if has_borders else 
-                            "colored" if has_fills else "simple"
+            "layer_detection": {
+                "recommended_layers": optimal_layers,
+                "reason": f"Found {peaks} distinct brightness levels, range={lum_range:.0f}"
             },
             "expected_output": {
                 "white_print": {
-                    "dark_borders": "BLACK (preserved for contrast)" if has_borders else "WHITE",
-                    "colored_fills": "WHITE (printed)" if has_fills else "N/A",
-                    "description": "Black borders create outline, white fills are printed on dark shirt"
+                    "description": "All shades of white/light gray, NO black",
+                    "colors_darkest_to_lightest": white_colors,
+                    "fill_color": "rgb(255,255,255)",
+                    "border_shades": f"Graduated by {contrast_step}% steps"
                 },
                 "black_print": {
-                    "dark_borders": "BLACK (printed)" if has_borders else "BLACK",
-                    "colored_fills": "GRAY (contrast with borders)" if has_fills else "N/A",
-                    "description": "Black borders printed, gray fills create contrast on light shirt"
+                    "description": "All shades of black/dark gray, NO white",
+                    "colors_darkest_to_lightest": black_colors,
+                    "fill_color": "rgb(0,0,0)",
+                    "border_shades": f"Graduated by {contrast_step}% steps"
                 }
             },
             "api_usage": {
-                "for_dark_shirt": "POST /smart-print-ready with print_color=white",
-                "for_light_shirt": "POST /smart-print-ready with print_color=black",
-                "optional": "border_contrast=high|medium|auto"
+                "basic": "POST /smart-print-ready with print_color=white or black",
+                "custom_layers": f"Add layers={optimal_layers} to override auto-detection",
+                "custom_contrast": "Add contrast_step=10|15|20|25|30 to adjust shade difference"
             }
         })
         
