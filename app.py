@@ -106,6 +106,405 @@ def admin():
         "coffee_level": f"{random.randint(60, 100)}%"
     })
 
+@app.route('/smart-print-ready', methods=['POST'])
+def smart_print_ready():
+    """
+    🎯 ONE ENDPOINT TO RULE THEM ALL
+    
+    Automatically analyzes logo and creates perfect print-ready version.
+    Just send image + print_color, get optimal result.
+    
+    Parameters:
+    - image: file (required)
+    - print_color: 'white' or 'black' (required)
+    - mode: 'auto', 'bordered', 'flat' (default: 'auto')
+    
+    The endpoint automatically:
+    - Detects and removes background
+    - Identifies borders vs fills
+    - Preserves logo structure
+    - Optimizes for print/mockup use
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        print_color = request.form.get('print_color', '').lower()
+        mode = request.form.get('mode', 'auto').lower()
+        
+        if print_color not in ['white', 'black']:
+            return jsonify({
+                "error": "print_color is required and must be 'white' or 'black'",
+                "example": "print_color=white (for dark shirts) or print_color=black (for light shirts)"
+            }), 400
+        
+        # Load image
+        img = Image.open(file.stream).convert('RGBA')
+        data = np.array(img)
+        height, width = data.shape[:2]
+        total_pixels = height * width
+        
+        r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
+        original_alpha = a.copy()
+        
+        # ============================================================
+        # STEP 1: ANALYZE
+        # ============================================================
+        
+        analysis = {
+            "background_type": "unknown",
+            "has_borders": False,
+            "logo_type": "unknown",
+            "complexity": "simple",
+            "decisions": []
+        }
+        
+        # 1a. Analyze transparency
+        has_transparency = np.any(a < 255)
+        fully_transparent_pixels = np.sum(a == 0)
+        transparency_ratio = fully_transparent_pixels / total_pixels
+        
+        # 1b. Analyze background from corners and edges
+        corner_samples = [
+            data[0, 0, :3],
+            data[0, -1, :3],
+            data[-1, 0, :3],
+            data[-1, -1, :3],
+            data[0, width//2, :3],
+            data[-1, width//2, :3],
+            data[height//2, 0, :3],
+            data[height//2, -1, :3]
+        ]
+        avg_corner = np.mean(corner_samples, axis=0)
+        corner_std = np.std(corner_samples, axis=0)
+        
+        # Determine background type
+        if transparency_ratio > 0.1:
+            analysis["background_type"] = "transparent"
+        elif np.mean(avg_corner) > 230 and np.mean(corner_std) < 20:
+            analysis["background_type"] = "white"
+        elif np.mean(avg_corner) < 25 and np.mean(corner_std) < 20:
+            analysis["background_type"] = "black"
+        else:
+            analysis["background_type"] = "colored_or_complex"
+        
+        # 1c. Analyze edges/borders
+        gray = cv2.cvtColor(data[:,:,:3], cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_pixel_count = np.sum(edges > 0)
+        edge_ratio = edge_pixel_count / total_pixels
+        
+        analysis["has_borders"] = edge_ratio > 0.005  # More than 0.5% edges
+        
+        # 1d. Analyze color distribution
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
+        
+        non_transparent_mask = a > 0
+        if np.any(non_transparent_mask):
+            lum_values = luminance[non_transparent_mask]
+            dark_ratio = np.sum(lum_values < 60) / len(lum_values)
+            light_ratio = np.sum(lum_values > 200) / len(lum_values)
+            mid_ratio = 1 - dark_ratio - light_ratio
+            
+            # Check color variance (is it multi-colored?)
+            color_std = np.std(data[non_transparent_mask][:, :3], axis=0)
+            is_multicolor = np.mean(color_std) > 50
+        else:
+            dark_ratio = light_ratio = mid_ratio = 0
+            is_multicolor = False
+        
+        # 1e. Determine logo type
+        if mode != 'auto':
+            analysis["logo_type"] = mode
+        elif not analysis["has_borders"] and not is_multicolor:
+            analysis["logo_type"] = "flat"
+        elif analysis["has_borders"]:
+            analysis["logo_type"] = "bordered"
+        else:
+            analysis["logo_type"] = "complex"
+        
+        analysis["complexity"] = "complex" if is_multicolor else "simple"
+        
+        # ============================================================
+        # STEP 2: DECIDE PROCESSING STRATEGY
+        # ============================================================
+        
+        # 2a. Background removal strategy
+        remove_bg = analysis["background_type"] in ["white", "black", "colored_or_complex"]
+        if remove_bg:
+            analysis["decisions"].append(f"Remove {analysis['background_type']} background")
+        
+        # 2b. Border handling strategy
+        if analysis["logo_type"] == "flat":
+            border_strategy = "none"
+            analysis["decisions"].append("Flat logo - simple solid conversion")
+        elif analysis["logo_type"] == "bordered":
+            border_strategy = "transparent"
+            analysis["decisions"].append("Bordered logo - make borders transparent for shirt color to show")
+        else:
+            border_strategy = "smart"
+            analysis["decisions"].append("Complex logo - smart edge preservation")
+        
+        # 2c. Sensitivity based on complexity
+        if analysis["complexity"] == "complex":
+            canny_low, canny_high = 30, 100
+            dilate_size = 2
+            analysis["decisions"].append("High sensitivity for complex logo")
+        else:
+            canny_low, canny_high = 50, 150
+            dilate_size = 2
+            analysis["decisions"].append("Medium sensitivity for simple logo")
+        
+        # ============================================================
+        # STEP 3: PROCESS
+        # ============================================================
+        
+        # 3a. Remove background
+        if remove_bg:
+            if analysis["background_type"] == "white":
+                bg_mask = (r > 235) & (g > 235) & (b > 235)
+            elif analysis["background_type"] == "black":
+                bg_mask = (r < 20) & (g < 20) & (b < 20)
+            else:
+                # Match corner color with tolerance
+                diff = np.sqrt(
+                    (r.astype(np.float32) - avg_corner[0])**2 +
+                    (g.astype(np.float32) - avg_corner[1])**2 +
+                    (b.astype(np.float32) - avg_corner[2])**2
+                )
+                bg_mask = diff < 40
+            
+            # Refine background mask - remove small holes
+            bg_mask_uint8 = bg_mask.astype(np.uint8) * 255
+            kernel = np.ones((3, 3), np.uint8)
+            bg_mask_uint8 = cv2.morphologyEx(bg_mask_uint8, cv2.MORPH_CLOSE, kernel)
+            bg_mask = bg_mask_uint8 > 127
+        else:
+            bg_mask = original_alpha == 0
+        
+        # Include already transparent pixels in background
+        bg_mask = bg_mask | (original_alpha == 0)
+        
+        # 3b. Detect and handle borders
+        if border_strategy != "none":
+            # Edge detection
+            edges_detected = cv2.Canny(gray, canny_low, canny_high)
+            
+            # Dilate edges slightly
+            kernel = np.ones((dilate_size, dilate_size), np.uint8)
+            edges_dilated = cv2.dilate(edges_detected, kernel, iterations=1)
+            
+            # Dark pixels are likely borders/outlines
+            dark_mask = luminance < 50
+            
+            # Combine: edges OR very dark pixels, but NOT background
+            border_mask = ((edges_dilated > 0) | dark_mask) & ~bg_mask
+            
+            # Clean up border mask
+            border_mask_uint8 = border_mask.astype(np.uint8) * 255
+            border_mask_uint8 = cv2.morphologyEx(border_mask_uint8, cv2.MORPH_OPEN, kernel)
+            border_mask = border_mask_uint8 > 127
+        else:
+            border_mask = np.zeros((height, width), dtype=bool)
+        
+        # 3c. Create fill mask
+        fill_mask = ~bg_mask & ~border_mask
+        
+        # 3d. Build result image
+        result = np.zeros((height, width, 4), dtype=np.uint8)
+        
+        # Set colors
+        if print_color == 'white':
+            fill_rgba = [255, 255, 255, 255]
+        else:
+            fill_rgba = [0, 0, 0, 255]
+        
+        # Apply fills
+        result[fill_mask] = fill_rgba
+        
+        # Apply borders based on strategy
+        if border_strategy == "transparent":
+            # Borders become transparent - shirt color shows through
+            result[border_mask] = [0, 0, 0, 0]
+        elif border_strategy == "smart":
+            # For complex logos, keep some border definition
+            # Use semi-transparency
+            result[border_mask] = [0, 0, 0, 0]
+        
+        # Background is transparent
+        result[bg_mask] = [0, 0, 0, 0]
+        
+        # 3e. Anti-aliasing preservation
+        # Find edges of fill areas and smooth them
+        fill_mask_uint8 = fill_mask.astype(np.uint8) * 255
+        fill_edges = cv2.Canny(fill_mask_uint8, 100, 200)
+        fill_edges_dilated = cv2.dilate(fill_edges, np.ones((2, 2), np.uint8), iterations=1)
+        
+        # Apply slight transparency on edges for smoother appearance
+        aa_mask = (fill_edges_dilated > 0) & fill_mask
+        result[aa_mask, 3] = 220  # Slightly transparent edges
+        
+        # ============================================================
+        # STEP 4: OUTPUT
+        # ============================================================
+        
+        result_img = Image.fromarray(result, 'RGBA')
+        
+        output = BytesIO()
+        result_img.save(output, format='PNG', optimize=True)
+        output.seek(0)
+        
+        # Stats
+        fill_pixels = int(np.sum(fill_mask))
+        border_pixels = int(np.sum(border_mask))
+        bg_pixels = int(np.sum(bg_mask))
+        
+        response = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name=f'print_ready_{print_color}.png'
+        )
+        
+        # Include analysis in headers for debugging
+        response.headers['X-Print-Color'] = print_color.upper()
+        response.headers['X-Background-Detected'] = analysis["background_type"]
+        response.headers['X-Logo-Type'] = analysis["logo_type"]
+        response.headers['X-Has-Borders'] = str(analysis["has_borders"])
+        response.headers['X-Complexity'] = analysis["complexity"]
+        response.headers['X-Fill-Pixels'] = str(fill_pixels)
+        response.headers['X-Border-Pixels'] = str(border_pixels)
+        response.headers['X-BG-Pixels-Removed'] = str(bg_pixels)
+        response.headers['X-Decisions'] = "; ".join(analysis["decisions"])
+        
+        return response
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@app.route('/smart-print-ready/analyze', methods=['POST'])
+def smart_print_ready_analyze():
+    """
+    Debug endpoint - shows what smart-print-ready will detect
+    Same analysis without processing, useful for debugging
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+    
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        
+        img = Image.open(file.stream).convert('RGBA')
+        data = np.array(img)
+        height, width = data.shape[:2]
+        total_pixels = height * width
+        
+        r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
+        
+        # Transparency analysis
+        has_transparency = np.any(a < 255)
+        fully_transparent = int(np.sum(a == 0))
+        
+        # Background analysis
+        corner_samples = [
+            data[0, 0, :3], data[0, -1, :3],
+            data[-1, 0, :3], data[-1, -1, :3]
+        ]
+        avg_corner = np.mean(corner_samples, axis=0)
+        
+        if fully_transparent / total_pixels > 0.1:
+            bg_type = "transparent"
+        elif np.mean(avg_corner) > 230:
+            bg_type = "white"
+        elif np.mean(avg_corner) < 25:
+            bg_type = "black"
+        else:
+            bg_type = "colored_or_complex"
+        
+        # Edge analysis
+        gray = cv2.cvtColor(data[:,:,:3], cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150)
+        edge_pixels = int(np.sum(edges > 0))
+        has_borders = edge_pixels / total_pixels > 0.005
+        
+        # Color analysis
+        non_transparent = a > 0
+        if np.any(non_transparent):
+            luminance = 0.299 * r + 0.587 * g + 0.114 * b
+            lum_values = luminance[non_transparent]
+            
+            dark_pixels = int(np.sum(lum_values < 60))
+            mid_pixels = int(np.sum((lum_values >= 60) & (lum_values <= 200)))
+            light_pixels = int(np.sum(lum_values > 200))
+            
+            color_std = np.std(data[non_transparent][:, :3], axis=0)
+            is_multicolor = bool(np.mean(color_std) > 50)
+        else:
+            dark_pixels = mid_pixels = light_pixels = 0
+            is_multicolor = False
+        
+        # Determine logo type
+        if not has_borders and not is_multicolor:
+            logo_type = "flat"
+        elif has_borders:
+            logo_type = "bordered"
+        else:
+            logo_type = "complex"
+        
+        return jsonify({
+            "image": {
+                "dimensions": f"{width}x{height}",
+                "total_pixels": total_pixels
+            },
+            "background": {
+                "type": bg_type,
+                "has_transparency": has_transparency,
+                "transparent_pixels": fully_transparent,
+                "corner_avg_color": [int(c) for c in avg_corner],
+                "will_be_removed": bg_type in ["white", "black", "colored_or_complex"]
+            },
+            "structure": {
+                "edge_pixels": edge_pixels,
+                "edge_ratio": f"{(edge_pixels/total_pixels)*100:.2f}%",
+                "has_borders": has_borders,
+                "logo_type": logo_type
+            },
+            "colors": {
+                "dark_pixels": dark_pixels,
+                "mid_pixels": mid_pixels,
+                "light_pixels": light_pixels,
+                "is_multicolor": is_multicolor,
+                "complexity": "complex" if is_multicolor else "simple"
+            },
+            "recommendations": {
+                "for_dark_shirt": "POST /smart-print-ready with print_color=white",
+                "for_light_shirt": "POST /smart-print-ready with print_color=black"
+            }
+        })
+        
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Analysis failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+        
 @app.route('/force-solid-with-outline', methods=['POST'])
 def force_solid_with_outline():
     """
