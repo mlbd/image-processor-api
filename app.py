@@ -108,19 +108,16 @@ def admin():
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
     """
-    🎯 ULTIMATE PRINT-READY CONVERSION v3
+    🎯 ULTIMATE PRINT-READY CONVERSION v3.1
     
     Converts ALL colors to shades of the target print_color.
-    - Fill = 100% print_color
-    - Borders = graduated shades (90%, 80%, 70%... of print_color)
-    
-    NO opposite colors remain (no black when white, no white when black)
     
     Parameters:
     - image: file (required)
     - print_color: 'white' or 'black' (required)
-    - layers: 2-5 (default: 'auto' - detects from image)
-    - contrast_step: 10-30 (default: 15) - percentage difference between layers
+    - layers: 2-5 (default: 'auto')
+    - white_step: 5-30 (default: 10) - contrast step for white print
+    - black_step: 15-50 (default: 33) - contrast step for black print
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -133,7 +130,10 @@ def smart_print_ready():
         file = request.files['image']
         print_color = request.form.get('print_color', '').lower()
         num_layers = request.form.get('layers', 'auto').lower()
-        contrast_step = int(request.form.get('contrast_step', 15))
+        
+        # Different default steps for white vs black
+        white_step = int(request.form.get('white_step', 10))  # Default 10% for white
+        black_step = int(request.form.get('black_step', 33))  # Default 33% for black
         
         if print_color not in ['white', 'black']:
             return jsonify({
@@ -141,8 +141,9 @@ def smart_print_ready():
                 "usage": "print_color=white (for dark shirts) or print_color=black (for light shirts)"
             }), 400
         
-        # Clamp contrast_step
-        contrast_step = max(10, min(30, contrast_step))
+        # Clamp steps
+        white_step = max(5, min(30, white_step))
+        black_step = max(15, min(50, black_step))
         
         # Load image
         img = Image.open(file.stream).convert('RGBA')
@@ -203,53 +204,44 @@ def smart_print_ready():
             )
             bg_mask = color_diff < 50
         
-        # Include already transparent pixels
         bg_mask = bg_mask | (original_alpha < 128)
         
-        # Clean up background mask with morphology
+        # Clean up background mask
         kernel = np.ones((5, 5), np.uint8)
         bg_mask_uint8 = bg_mask.astype(np.uint8) * 255
         bg_mask_uint8 = cv2.morphologyEx(bg_mask_uint8, cv2.MORPH_CLOSE, kernel)
         
-        # Flood fill from corners to ensure connected background
+        # Flood fill from corners
         flood_mask = np.zeros((height + 2, width + 2), np.uint8)
         bg_flood = bg_mask_uint8.copy()
         
-        # Flood from corners
         for y, x in [(0, 0), (0, width-1), (height-1, 0), (height-1, width-1)]:
             if bg_mask_uint8[y, x] > 127:
                 cv2.floodFill(bg_flood, flood_mask, (x, y), 255)
         
         bg_mask = bg_flood > 127
-        
         logo_mask = ~bg_mask & (original_alpha > 0)
         
         if not np.any(logo_mask):
             return jsonify({"error": "No logo content found after background removal"}), 400
         
         # ============================================================
-        # STEP 2: CALCULATE LUMINANCE FOR ALL LOGO PIXELS
+        # STEP 2: CALCULATE LUMINANCE
         # ============================================================
         
         luminance = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
-        
-        # Get luminance values for logo pixels only
         logo_luminance = luminance[logo_mask]
+        
+        lum_min = np.min(logo_luminance)
+        lum_max = np.max(logo_luminance)
+        lum_range = lum_max - lum_min
         
         # ============================================================
         # STEP 3: DETERMINE NUMBER OF LAYERS
         # ============================================================
         
-        lum_min = np.min(logo_luminance)
-        lum_max = np.max(logo_luminance)
-        lum_range = lum_max - lum_min
-        lum_std = np.std(logo_luminance)
-        
         if num_layers == 'auto':
-            # Analyze histogram to find natural clusters
             hist, bins = np.histogram(logo_luminance, bins=32)
-            
-            # Find significant peaks
             threshold = np.max(hist) * 0.1
             peaks = 0
             in_peak = False
@@ -262,7 +254,6 @@ def smart_print_ready():
             
             optimal_layers = max(2, min(5, peaks))
             
-            # Also consider luminance range
             if lum_range < 50:
                 optimal_layers = 2
             elif lum_range < 100:
@@ -275,7 +266,7 @@ def smart_print_ready():
                 optimal_layers = 3
         
         # ============================================================
-        # STEP 4: K-MEANS CLUSTERING ON LUMINANCE
+        # STEP 4: K-MEANS CLUSTERING
         # ============================================================
         
         logo_lum_flat = logo_luminance.reshape(-1, 1).astype(np.float32)
@@ -290,48 +281,52 @@ def smart_print_ready():
             cv2.KMEANS_PP_CENTERS
         )
         
-        # Sort centers by luminance
         center_values = centers.flatten()
         center_order = np.argsort(center_values)  # Darkest to lightest
         
-        # Create mapping: original label -> sorted rank (0=darkest, n=lightest)
         label_to_rank = {old_label: rank for rank, old_label in enumerate(center_order)}
         
         # ============================================================
-        # STEP 5: GENERATE OUTPUT COLORS
+        # STEP 5: GENERATE OUTPUT COLORS (DIFFERENT STEPS!)
         # ============================================================
         
-        # Generate graduated shades based on print_color
         output_colors = []
         
         if print_color == 'white':
-            # All shades of white (lightest = fill, darker = borders)
-            # Layer 0 (darkest original) → lightest shade (most contrast from fill)
-            # Layer n (lightest original) → 100% white (fill)
+            # WHITE PRINT: 10% steps (subtle gradation)
+            # Lightest original → 100% white (fill)
+            # Darker originals → graduated lighter grays
             
             for i in range(optimal_layers):
-                # Reverse: darkest original becomes the "outer" shade
+                # Reverse mapping: darkest original = most contrast from fill
                 shade_index = optimal_layers - 1 - i
-                darkness = shade_index * contrast_step  # 0%, 15%, 30%...
-                gray_value = int(255 - (255 * darkness / 100))
-                gray_value = max(180, gray_value)  # Never darker than rgb(180,180,180)
+                darkness_percent = shade_index * white_step  # 0%, 10%, 20%, 30%...
+                
+                # Calculate gray value (255 = white, lower = darker)
+                gray_value = int(255 * (100 - darkness_percent) / 100)
+                gray_value = max(150, gray_value)  # Never darker than rgb(150,150,150)
+                
                 output_colors.append([gray_value, gray_value, gray_value])
             
-            # Ensure the lightest (fill) is pure white
+            # Ensure lightest layer (fill) is pure white
             output_colors[-1] = [255, 255, 255]
             
         else:  # print_color == 'black'
-            # All shades of black (darkest = fill, lighter = borders)
-            # Layer 0 (darkest original) → 100% black (fill)
-            # Layer n (lightest original) → lightest shade
+            # BLACK PRINT: 33% steps (stronger gradation)
+            # Darkest original → 100% black (fill)
+            # Lighter originals → graduated darker grays
             
             for i in range(optimal_layers):
-                lightness = i * contrast_step  # 0%, 15%, 30%...
-                gray_value = int(255 * lightness / 100)
-                gray_value = min(75, gray_value)  # Never lighter than rgb(75,75,75)
+                lightness_percent = i * black_step  # 0%, 33%, 66%, 99%...
+                lightness_percent = min(lightness_percent, 90)  # Cap at 90%
+                
+                # Calculate gray value (0 = black, higher = lighter)
+                gray_value = int(255 * lightness_percent / 100)
+                gray_value = min(230, gray_value)  # Never lighter than rgb(230,230,230)
+                
                 output_colors.append([gray_value, gray_value, gray_value])
             
-            # Ensure the darkest (fill) is pure black
+            # Ensure darkest layer (fill) is pure black
             output_colors[0] = [0, 0, 0]
         
         # ============================================================
@@ -340,38 +335,23 @@ def smart_print_ready():
         
         result = np.zeros((height, width, 4), dtype=np.uint8)
         
-        # Background = fully transparent
+        # Background = transparent
         result[bg_mask] = [0, 0, 0, 0]
         
-        # Map each logo pixel to its output color
+        # Map logo pixels
         logo_indices = np.where(logo_mask)
         logo_y = logo_indices[0]
         logo_x = logo_indices[1]
         
         for i, (y, x) in enumerate(zip(logo_y, logo_x)):
             original_label = labels[i][0]
-            rank = label_to_rank[original_label]  # 0=darkest, n-1=lightest
+            rank = label_to_rank[original_label]
             
             color = output_colors[rank]
             result[y, x] = [color[0], color[1], color[2], 255]
         
         # ============================================================
-        # STEP 7: PRESERVE ANTI-ALIASING ON EDGES
-        # ============================================================
-        
-        # Find edge pixels (where alpha was partial in original or at logo boundary)
-        logo_mask_uint8 = logo_mask.astype(np.uint8) * 255
-        edges = cv2.Canny(logo_mask_uint8, 100, 200)
-        edge_dilated = cv2.dilate(edges, np.ones((2, 2), np.uint8), iterations=1)
-        edge_mask = edge_dilated > 0
-        
-        # Apply original partial transparency to edges for smoother look
-        edge_pixels = edge_mask & logo_mask
-        # Keep full opacity but could soften if needed:
-        # result[edge_pixels, 3] = np.minimum(result[edge_pixels, 3], original_alpha[edge_pixels])
-        
-        # ============================================================
-        # STEP 8: OUTPUT
+        # STEP 7: OUTPUT
         # ============================================================
         
         result_img = Image.fromarray(result, 'RGBA')
@@ -380,16 +360,8 @@ def smart_print_ready():
         result_img.save(output, format='PNG', optimize=True)
         output.seek(0)
         
-        # Calculate stats for each layer
-        layer_stats = {}
-        for rank in range(optimal_layers):
-            count = sum(1 for i in range(len(labels)) if label_to_rank[labels[i][0]] == rank)
-            layer_stats[f"layer_{rank}"] = {
-                "pixels": count,
-                "output_color": output_colors[rank],
-                "role": "fill" if (print_color == 'white' and rank == optimal_layers-1) or 
-                                 (print_color == 'black' and rank == 0) else "border/detail"
-            }
+        # Determine which step was used
+        used_step = white_step if print_color == 'white' else black_step
         
         response = send_file(
             output,
@@ -401,11 +373,9 @@ def smart_print_ready():
         response.headers['X-Print-Color'] = print_color.upper()
         response.headers['X-Background-Type'] = bg_type
         response.headers['X-Layers-Used'] = str(optimal_layers)
-        response.headers['X-Contrast-Step'] = f"{contrast_step}%"
-        response.headers['X-Luminance-Range'] = f"{lum_min:.0f}-{lum_max:.0f}"
+        response.headers['X-Contrast-Step'] = f"{used_step}%"
         response.headers['X-Output-Colors'] = str(output_colors)
         response.headers['X-Logo-Pixels'] = str(len(logo_y))
-        response.headers['X-BG-Pixels-Removed'] = str(int(np.sum(bg_mask)))
         
         return response
         
