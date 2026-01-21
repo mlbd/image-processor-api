@@ -1145,86 +1145,378 @@ def debug_smart_color():
         
 @app.route('/replace-dark-to-white', methods=['POST'])
 def replace_dark():
-    """Replace dark colors with white"""
+    """
+    Replace dark-ish pixels with white — with an AUTO invert mode:
+
+    ✅ If the logo area is basically ONLY black/white (2-tone),
+       then SWAP them:
+         - black-ish  -> white
+         - white-ish  -> black
+       (anti-aliased mid pixels are pushed to nearest side)
+
+    ✅ If the logo area contains other colors/tones (multi-tone),
+       then ONLY:
+         - black-ish -> white
+       (white + other colors remain unchanged)
+
+    Form-data params:
+    - image: file (required)
+    - threshold: 0..255 (default DEFAULT_THRESHOLD)  # used for "black-ish"
+    Optional:
+    - white_threshold: 1..80 (default 35)           # used for "white-ish"
+    - bw_ratio: 0..1 (default 0.97)                 # how “pure” B/W the logo must be to invert
+    - alpha_min: 0..255 (default 10)                # pixels below are treated as transparent
+    """
     auth_error = verify_api_key()
     if auth_error:
         return auth_error
-    
+
     try:
-        threshold = int(request.form.get('threshold', DEFAULT_THRESHOLD))
-        
-        if threshold < 0 or threshold > 255:
-            return jsonify({"error": "Threshold must be between 0 and 255"}), 400
-        
         if 'image' not in request.files:
             return jsonify({"error": "No image file provided"}), 400
-        
+
         file = request.files['image']
-        
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
-        
+
+        # ---------- params ----------
+        threshold = int(request.form.get('threshold', DEFAULT_THRESHOLD))
+        if threshold < 0 or threshold > 255:
+            return jsonify({"error": "Threshold must be between 0 and 255"}), 400
+
+        white_threshold = int(request.form.get('white_threshold', 35))
+        white_threshold = max(1, min(80, white_threshold))
+
+        bw_ratio_cut = float(request.form.get('bw_ratio', 0.97))
+        bw_ratio_cut = max(0.0, min(1.0, bw_ratio_cut))
+
+        alpha_min = int(request.form.get('alpha_min', 10))
+        alpha_min = max(0, min(255, alpha_min))
+
+        # ---------- load ----------
         img = Image.open(file.stream).convert('RGBA')
         data = np.array(img)
-        
-        r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
-        dark_mask = (r < threshold) & (g < threshold) & (b < threshold)
-        
-        data[dark_mask, 0:3] = [255, 255, 255]
-        
+        h, w = data.shape[:2]
+
+        r = data[:, :, 0].astype(np.uint8)
+        g = data[:, :, 1].astype(np.uint8)
+        b = data[:, :, 2].astype(np.uint8)
+        a = data[:, :, 3].astype(np.uint8)
+
+        # ============================================================
+        # STEP 1: BACKGROUND DETECTION (so we don’t invert the background)
+        # ============================================================
+        corners = [
+            data[0, 0],
+            data[0, w - 1],
+            data[h - 1, 0],
+            data[h - 1, w - 1]
+        ]
+        corner_rgb = np.array([c[:3] for c in corners], dtype=np.float32)
+        corner_a = np.array([c[3] for c in corners], dtype=np.float32)
+
+        avg_corner = np.mean(corner_rgb, axis=0)
+        avg_alpha = float(np.mean(corner_a))
+        corner_std = float(np.std(corner_rgb))
+        corners_consistent = corner_std < 30
+
+        # Default: treat transparent as background
+        bg_mask = (a <= alpha_min)
+
+        if avg_alpha > 200 and corners_consistent:
+            mean_corner = float(np.mean(avg_corner))
+            tolerance = 20
+
+            # white-ish corner bg
+            if mean_corner > 240:
+                bg_mask = bg_mask | ((r > 250) & (g > 250) & (b > 250) & (a > 200))
+            # black-ish corner bg
+            elif mean_corner < 15:
+                bg_mask = bg_mask | ((r < 5) & (g < 5) & (b < 5) & (a > 200))
+            else:
+                # colored-ish bg (use corner color with tolerance)
+                bg_mask = bg_mask | (
+                    (np.abs(r.astype(np.int16) - int(avg_corner[0])) < tolerance) &
+                    (np.abs(g.astype(np.int16) - int(avg_corner[1])) < tolerance) &
+                    (np.abs(b.astype(np.int16) - int(avg_corner[2])) < tolerance) &
+                    (a > 200)
+                )
+
+            # Flood fill from corners (keeps only corner-connected bg)
+            potential_bg = (bg_mask.astype(np.uint8) * 255)
+            connected_bg = np.zeros_like(potential_bg)
+
+            for sy, sx in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
+                if potential_bg[sy, sx] > 0:
+                    temp = potential_bg.copy()
+                    flood = np.zeros((h + 2, w + 2), np.uint8)
+                    cv2.floodFill(temp, flood, (sx, sy), 128)
+                    connected_bg[temp == 128] = 255
+
+            bg_mask = connected_bg > 0
+
+        logo_mask = (~bg_mask) & (a > alpha_min)
+        if int(np.sum(logo_mask)) == 0:
+            # fallback: alpha-only logo
+            logo_mask = (a > alpha_min)
+            bg_mask = ~logo_mask
+
+        # ============================================================
+        # STEP 2: Decide if logo is “mostly BW only”
+        # ============================================================
+        white_cut = 255 - white_threshold
+
+        blackish = logo_mask & (r < threshold) & (g < threshold) & (b < threshold)
+        whiteish = logo_mask & (r > white_cut) & (g > white_cut) & (b > white_cut)
+        bw_mask = blackish | whiteish
+
+        logo_px = int(np.sum(logo_mask))
+        bw_px = int(np.sum(bw_mask))
+
+        # Ratio of pixels that are either black-ish or white-ish
+        bw_ratio = (bw_px / max(1, logo_px))
+
+        # Two-tone if almost everything is BW (allow tiny anti-aliasing mid pixels)
+        is_two_tone_bw = (bw_ratio >= bw_ratio_cut)
+
+        # Luminance for anti-aliased pixels handling (only when in invert mode)
+        luminance = (0.299 * r.astype(np.float32) + 0.587 * g.astype(np.float32) + 0.114 * b.astype(np.float32))
+
+        # ============================================================
+        # STEP 3: Apply transformation
+        # ============================================================
+        if is_two_tone_bw:
+            # Invert black-ish and white-ish inside logo area
+            data[blackish, 0] = 255
+            data[blackish, 1] = 255
+            data[blackish, 2] = 255
+
+            data[whiteish, 0] = 0
+            data[whiteish, 1] = 0
+            data[whiteish, 2] = 0
+
+            # Any “mid” pixels (usually anti-aliasing) -> push to nearest side
+            mid = logo_mask & (~blackish) & (~whiteish)
+            if int(np.sum(mid)) > 0:
+                mid_to_white = mid & (luminance < 128)   # darker edge becomes white after invert
+                mid_to_black = mid & (~mid_to_white)
+
+                data[mid_to_white, 0:3] = [255, 255, 255]
+                data[mid_to_black, 0:3] = [0, 0, 0]
+        else:
+            # Multi-tone: ONLY make dark-ish parts white (your current behavior)
+            dark_mask = blackish
+            data[dark_mask, 0:3] = [255, 255, 255]
+
+        # ============================================================
+        # OUTPUT
+        # ============================================================
         result_img = Image.fromarray(data, 'RGBA')
-        
         output = BytesIO()
-        result_img.save(output, format='PNG')
+        result_img.save(output, format='PNG', optimize=True)
         output.seek(0)
-        
-        return send_file(
+
+        response = send_file(
             output,
             mimetype='image/png',
             as_attachment=True,
             download_name='processed_image.png'
         )
-        
+
+        # Helpful debug headers
+        response.headers['X-Mode'] = 'invert-bw' if is_two_tone_bw else 'dark-to-white'
+        response.headers['X-BW-Ratio'] = f"{bw_ratio:.4f}"
+        response.headers['X-Threshold'] = str(threshold)
+        response.headers['X-White-Threshold'] = str(white_threshold)
+
+        return response
+
     except Exception as e:
-        return jsonify({"error": "Processing failed", "details": str(e)}), 500
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 @app.route('/replace-light-to-dark', methods=['POST'])
 def replace_light():
-    """Replace light/white colors with dark/black"""
+    """
+    Replace light/white-ish pixels with black — with an AUTO invert mode:
+
+    ✅ If the logo area is basically ONLY black/white (2-tone),
+       then SWAP them:
+         - white-ish -> black
+         - black-ish -> white
+       (anti-aliased mid pixels are pushed to nearest side)
+
+    ✅ If the logo area contains other colors/tones (multi-tone),
+       then ONLY:
+         - white-ish -> black
+       (dark + other colors remain unchanged)
+
+    Form-data params:
+    - image: file (required)
+    - threshold: 0..255 (default 200)          # used for "white-ish" (r/g/b > threshold)
+    Optional:
+    - black_threshold: 1..120 (default 80)     # used for "black-ish" (r/g/b < black_threshold)
+    - bw_ratio: 0..1 (default 0.97)            # how “pure” B/W the logo must be to invert
+    - alpha_min: 0..255 (default 10)           # pixels below are treated as transparent
+    """
     auth_error = verify_api_key()
     if auth_error:
         return auth_error
-    
+
     try:
-        threshold = int(request.form.get('threshold', 200))
-        
         if 'image' not in request.files:
             return jsonify({"error": "No image file provided"}), 400
-        
+
         file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+
+        # ---------- params ----------
+        threshold = int(request.form.get('threshold', 200))
+        threshold = max(0, min(255, threshold))
+
+        black_threshold = int(request.form.get('black_threshold', 80))
+        black_threshold = max(1, min(120, black_threshold))
+
+        bw_ratio_cut = float(request.form.get('bw_ratio', 0.97))
+        bw_ratio_cut = max(0.0, min(1.0, bw_ratio_cut))
+
+        alpha_min = int(request.form.get('alpha_min', 10))
+        alpha_min = max(0, min(255, alpha_min))
+
+        # ---------- load ----------
         img = Image.open(file.stream).convert('RGBA')
         data = np.array(img)
-        
-        r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
-        light_mask = (r > threshold) & (g > threshold) & (b > threshold)
-        
-        data[light_mask, 0:3] = [0, 0, 0]
-        
+        h, w = data.shape[:2]
+
+        r = data[:, :, 0].astype(np.uint8)
+        g = data[:, :, 1].astype(np.uint8)
+        b = data[:, :, 2].astype(np.uint8)
+        a = data[:, :, 3].astype(np.uint8)
+
+        # ============================================================
+        # STEP 1: BACKGROUND DETECTION (so we don’t invert the background)
+        # ============================================================
+        corners = [
+            data[0, 0],
+            data[0, w - 1],
+            data[h - 1, 0],
+            data[h - 1, w - 1]
+        ]
+        corner_rgb = np.array([c[:3] for c in corners], dtype=np.float32)
+        corner_a = np.array([c[3] for c in corners], dtype=np.float32)
+
+        avg_corner = np.mean(corner_rgb, axis=0)
+        avg_alpha = float(np.mean(corner_a))
+        corner_std = float(np.std(corner_rgb))
+        corners_consistent = corner_std < 30
+
+        bg_mask = (a <= alpha_min)
+
+        if avg_alpha > 200 and corners_consistent:
+            mean_corner = float(np.mean(avg_corner))
+            tolerance = 20
+
+            if mean_corner > 240:
+                bg_mask = bg_mask | ((r > 250) & (g > 250) & (b > 250) & (a > 200))
+            elif mean_corner < 15:
+                bg_mask = bg_mask | ((r < 5) & (g < 5) & (b < 5) & (a > 200))
+            else:
+                bg_mask = bg_mask | (
+                    (np.abs(r.astype(np.int16) - int(avg_corner[0])) < tolerance) &
+                    (np.abs(g.astype(np.int16) - int(avg_corner[1])) < tolerance) &
+                    (np.abs(b.astype(np.int16) - int(avg_corner[2])) < tolerance) &
+                    (a > 200)
+                )
+
+            potential_bg = (bg_mask.astype(np.uint8) * 255)
+            connected_bg = np.zeros_like(potential_bg)
+
+            for sy, sx in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
+                if potential_bg[sy, sx] > 0:
+                    temp = potential_bg.copy()
+                    flood = np.zeros((h + 2, w + 2), np.uint8)
+                    cv2.floodFill(temp, flood, (sx, sy), 128)
+                    connected_bg[temp == 128] = 255
+
+            bg_mask = connected_bg > 0
+
+        logo_mask = (~bg_mask) & (a > alpha_min)
+        if int(np.sum(logo_mask)) == 0:
+            logo_mask = (a > alpha_min)
+            bg_mask = ~logo_mask
+
+        # ============================================================
+        # STEP 2: Decide if logo is “mostly BW only”
+        # ============================================================
+        whiteish = logo_mask & (r > threshold) & (g > threshold) & (b > threshold)
+        blackish = logo_mask & (r < black_threshold) & (g < black_threshold) & (b < black_threshold)
+        bw_mask = whiteish | blackish
+
+        logo_px = int(np.sum(logo_mask))
+        bw_px = int(np.sum(bw_mask))
+        bw_ratio = (bw_px / max(1, logo_px))
+
+        is_two_tone_bw = (bw_ratio >= bw_ratio_cut)
+
+        # Luminance for pushing anti-aliased mid pixels
+        luminance = (0.299 * r.astype(np.float32) + 0.587 * g.astype(np.float32) + 0.114 * b.astype(np.float32))
+
+        # ============================================================
+        # STEP 3: Apply transformation
+        # ============================================================
+        if is_two_tone_bw:
+            # Swap inside logo
+            data[whiteish, 0:3] = [0, 0, 0]
+            data[blackish, 0:3] = [255, 255, 255]
+
+            # Push mid pixels to nearest side
+            mid = logo_mask & (~whiteish) & (~blackish)
+            if int(np.sum(mid)) > 0:
+                # After invert: lighter edges become white, darker edges become black
+                mid_to_black = mid & (luminance >= 128)
+                mid_to_white = mid & (~mid_to_black)
+
+                data[mid_to_black, 0:3] = [0, 0, 0]
+                data[mid_to_white, 0:3] = [255, 255, 255]
+        else:
+            # Multi-tone: only white-ish -> black (your original intention)
+            data[whiteish, 0:3] = [0, 0, 0]
+
+        # ============================================================
+        # OUTPUT
+        # ============================================================
         result_img = Image.fromarray(data, 'RGBA')
-        
         output = BytesIO()
-        result_img.save(output, format='PNG')
+        result_img.save(output, format='PNG', optimize=True)
         output.seek(0)
-        
-        return send_file(
+
+        response = send_file(
             output,
             mimetype='image/png',
             as_attachment=True,
             download_name='light_to_dark.png'
         )
-        
+
+        response.headers['X-Mode'] = 'invert-bw' if is_two_tone_bw else 'light-to-dark'
+        response.headers['X-BW-Ratio'] = f"{bw_ratio:.4f}"
+        response.headers['X-Threshold'] = str(threshold)
+        response.headers['X-Black-Threshold'] = str(black_threshold)
+
+        return response
+
     except Exception as e:
-        return jsonify({"error": "Processing failed", "details": str(e)}), 500
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
 
 @app.route('/replace-to-color', methods=['POST'])
 def replace_to_color():
