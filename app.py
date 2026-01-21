@@ -108,16 +108,18 @@ def admin():
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
     """
-    🎯 ULTIMATE PRINT-READY CONVERSION v3.1
+    🎯 ULTIMATE PRINT-READY CONVERSION v4
     
-    Converts ALL colors to shades of the target print_color.
+    Converts ALL colors to shades of target print_color.
+    PRESERVES all details - thin lines, dots, small elements.
     
     Parameters:
     - image: file (required)
     - print_color: 'white' or 'black' (required)
-    - layers: 2-5 (default: 'auto')
-    - white_step: 5-30 (default: 10) - contrast step for white print
-    - black_step: 15-50 (default: 33) - contrast step for black print
+    - layers: 2-6 (default: 'auto')
+    - white_step: 5-30 (default: 10)
+    - black_step: 15-50 (default: 33)
+    - preserve_all: 'true' or 'false' (default: 'true') - keep all details
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -130,10 +132,9 @@ def smart_print_ready():
         file = request.files['image']
         print_color = request.form.get('print_color', '').lower()
         num_layers = request.form.get('layers', 'auto').lower()
-        
-        # Different default steps for white vs black
-        white_step = int(request.form.get('white_step', 10))  # Default 10% for white
-        black_step = int(request.form.get('black_step', 33))  # Default 33% for black
+        white_step = int(request.form.get('white_step', 10))
+        black_step = int(request.form.get('black_step', 33))
+        preserve_all = request.form.get('preserve_all', 'true').lower() == 'true'
         
         if print_color not in ['white', 'black']:
             return jsonify({
@@ -141,7 +142,6 @@ def smart_print_ready():
                 "usage": "print_color=white (for dark shirts) or print_color=black (for light shirts)"
             }), 400
         
-        # Clamp steps
         white_step = max(5, min(30, white_step))
         black_step = max(15, min(50, black_step))
         
@@ -154,82 +154,121 @@ def smart_print_ready():
         original_alpha = a.copy()
         
         # ============================================================
-        # STEP 1: DETECT AND REMOVE BACKGROUND
+        # STEP 1: SIMPLE BACKGROUND DETECTION (NON-DESTRUCTIVE)
         # ============================================================
         
-        corner_positions = [
-            (0, 0), (0, width-1), (height-1, 0), (height-1, width-1),
-            (0, width//4), (0, width*3//4),
-            (height-1, width//4), (height-1, width*3//4),
-            (height//4, 0), (height*3//4, 0),
-            (height//4, width-1), (height*3//4, width-1)
+        # Only check actual corners (4 corners)
+        corners = [
+            data[0, 0],
+            data[0, width-1],
+            data[height-1, 0],
+            data[height-1, width-1]
         ]
         
-        corner_colors = []
-        corner_alphas = []
-        for y, x in corner_positions:
-            if 0 <= y < height and 0 <= x < width:
-                corner_colors.append(data[y, x, :3])
-                corner_alphas.append(data[y, x, 3])
+        corner_colors = np.array([c[:3] for c in corners])
+        corner_alphas = np.array([c[3] for c in corners])
         
         avg_corner = np.mean(corner_colors, axis=0)
         avg_alpha = np.mean(corner_alphas)
+        corner_std = np.std(corner_colors)
+        
+        # Determine if corners are consistent (likely background)
+        corners_consistent = corner_std < 30
         
         # Detect background type
         if avg_alpha < 128:
             bg_type = "transparent"
-            bg_mask = original_alpha < 128
-        elif np.mean(avg_corner) > 235:
+            bg_mask = original_alpha < 10  # Only truly transparent pixels
+        elif corners_consistent and np.mean(avg_corner) > 240:
             bg_type = "white"
-            color_diff = np.sqrt(
-                (r.astype(np.float32) - 255)**2 +
-                (g.astype(np.float32) - 255)**2 +
-                (b.astype(np.float32) - 255)**2
-            )
-            bg_mask = color_diff < 40
-        elif np.mean(avg_corner) < 25:
+            # Very strict white detection - only pure white
+            bg_mask = (r > 250) & (g > 250) & (b > 250) & (original_alpha > 200)
+        elif corners_consistent and np.mean(avg_corner) < 15:
             bg_type = "black"
-            color_diff = np.sqrt(
-                r.astype(np.float32)**2 +
-                g.astype(np.float32)**2 +
-                b.astype(np.float32)**2
-            )
-            bg_mask = color_diff < 40
-        else:
+            # Very strict black detection - only pure black
+            bg_mask = (r < 5) & (g < 5) & (b < 5) & (original_alpha > 200)
+        elif corners_consistent:
             bg_type = "colored"
-            color_diff = np.sqrt(
-                (r.astype(np.float32) - avg_corner[0])**2 +
-                (g.astype(np.float32) - avg_corner[1])**2 +
-                (b.astype(np.float32) - avg_corner[2])**2
+            # Match corner color very strictly
+            tolerance = 20
+            bg_mask = (
+                (np.abs(r.astype(np.int16) - int(avg_corner[0])) < tolerance) &
+                (np.abs(g.astype(np.int16) - int(avg_corner[1])) < tolerance) &
+                (np.abs(b.astype(np.int16) - int(avg_corner[2])) < tolerance) &
+                (original_alpha > 200)
             )
-            bg_mask = color_diff < 50
+        else:
+            bg_type = "mixed/none"
+            bg_mask = original_alpha < 10  # Only transparent
         
-        bg_mask = bg_mask | (original_alpha < 128)
-        
-        # Clean up background mask
-        kernel = np.ones((5, 5), np.uint8)
-        bg_mask_uint8 = bg_mask.astype(np.uint8) * 255
-        bg_mask_uint8 = cv2.morphologyEx(bg_mask_uint8, cv2.MORPH_CLOSE, kernel)
-        
-        # Flood fill from corners
-        flood_mask = np.zeros((height + 2, width + 2), np.uint8)
-        bg_flood = bg_mask_uint8.copy()
-        
-        for y, x in [(0, 0), (0, width-1), (height-1, 0), (height-1, width-1)]:
-            if bg_mask_uint8[y, x] > 127:
-                cv2.floodFill(bg_flood, flood_mask, (x, y), 255)
-        
-        bg_mask = bg_flood > 127
-        logo_mask = ~bg_mask & (original_alpha > 0)
-        
-        if not np.any(logo_mask):
-            return jsonify({"error": "No logo content found after background removal"}), 400
+        # Include already transparent pixels in background
+        bg_mask = bg_mask | (original_alpha < 10)
         
         # ============================================================
-        # STEP 2: CALCULATE LUMINANCE
+        # STEP 2: SAFE FLOOD FILL FROM CORNERS ONLY
+        # ============================================================
+        
+        # Only remove background that's connected to corners
+        # This prevents removing any internal elements
+        
+        if bg_type not in ["transparent", "mixed/none"]:
+            # Create a mask for flood fill
+            potential_bg = bg_mask.astype(np.uint8) * 255
+            
+            # Flood fill from each corner
+            connected_bg = np.zeros_like(potential_bg)
+            
+            for start_y, start_x in [(0, 0), (0, width-1), (height-1, 0), (height-1, width-1)]:
+                if potential_bg[start_y, start_x] > 0:
+                    # Create temp mask for this flood fill
+                    temp_mask = potential_bg.copy()
+                    flood_mask = np.zeros((height + 2, width + 2), np.uint8)
+                    
+                    cv2.floodFill(temp_mask, flood_mask, (start_x, start_y), 128)
+                    
+                    # Add flooded area to connected background
+                    connected_bg[temp_mask == 128] = 255
+            
+            # Only remove background that's connected to corners
+            bg_mask = connected_bg > 0
+        
+        # Logo mask = everything that's NOT background
+        logo_mask = ~bg_mask
+        
+        # ============================================================
+        # STEP 3: PRESERVE ALL - NO PIXEL LEFT BEHIND
+        # ============================================================
+        
+        if preserve_all:
+            # Include ANY pixel that has some opacity
+            logo_mask = logo_mask | (original_alpha > 10)
+            
+            # Re-exclude only the connected background
+            logo_mask = logo_mask & ~bg_mask
+        
+        # Ensure we have logo content
+        logo_pixel_count = np.sum(logo_mask)
+        
+        if logo_pixel_count == 0:
+            # Fallback: treat everything non-transparent as logo
+            logo_mask = original_alpha > 10
+            bg_mask = ~logo_mask
+            bg_type = "fallback-transparent-only"
+        
+        # ============================================================
+        # STEP 4: CALCULATE LUMINANCE FOR LOGO PIXELS
         # ============================================================
         
         luminance = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
+        
+        # Get luminance only for logo pixels
+        logo_indices = np.where(logo_mask)
+        logo_y = logo_indices[0]
+        logo_x = logo_indices[1]
+        
+        if len(logo_y) == 0:
+            return jsonify({"error": "No logo pixels found"}), 400
+        
         logo_luminance = luminance[logo_mask]
         
         lum_min = np.min(logo_luminance)
@@ -237,121 +276,121 @@ def smart_print_ready():
         lum_range = lum_max - lum_min
         
         # ============================================================
-        # STEP 3: DETERMINE NUMBER OF LAYERS
+        # STEP 5: DETERMINE LAYERS
         # ============================================================
         
         if num_layers == 'auto':
-            hist, bins = np.histogram(logo_luminance, bins=32)
-            threshold = np.max(hist) * 0.1
-            peaks = 0
-            in_peak = False
-            for count in hist:
-                if count > threshold and not in_peak:
-                    peaks += 1
-                    in_peak = True
-                elif count <= threshold:
-                    in_peak = False
-            
-            optimal_layers = max(2, min(5, peaks))
-            
-            if lum_range < 50:
+            if lum_range < 30:
                 optimal_layers = 2
-            elif lum_range < 100:
-                optimal_layers = min(optimal_layers, 3)
+            elif lum_range < 80:
+                optimal_layers = 3
+            elif lum_range < 150:
+                optimal_layers = 4
+            else:
+                optimal_layers = 5
         else:
             try:
                 optimal_layers = int(num_layers)
-                optimal_layers = max(2, min(5, optimal_layers))
+                optimal_layers = max(2, min(6, optimal_layers))
             except:
                 optimal_layers = 3
         
         # ============================================================
-        # STEP 4: K-MEANS CLUSTERING
+        # STEP 6: K-MEANS OR SIMPLE THRESHOLD BASED ON RANGE
         # ============================================================
         
-        logo_lum_flat = logo_luminance.reshape(-1, 1).astype(np.float32)
-        
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
-        _, labels, centers = cv2.kmeans(
-            logo_lum_flat,
-            optimal_layers,
-            None,
-            criteria,
-            10,
-            cv2.KMEANS_PP_CENTERS
-        )
-        
-        center_values = centers.flatten()
-        center_order = np.argsort(center_values)  # Darkest to lightest
-        
-        label_to_rank = {old_label: rank for rank, old_label in enumerate(center_order)}
+        if lum_range < 10:
+            # Very uniform - just use one color
+            optimal_layers = 1
+            labels = np.zeros((len(logo_luminance), 1), dtype=np.int32)
+            label_to_rank = {0: 0}
+        else:
+            # K-means clustering
+            logo_lum_flat = logo_luminance.reshape(-1, 1).astype(np.float32)
+            
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+            
+            # Ensure we don't request more clusters than pixels
+            actual_layers = min(optimal_layers, len(logo_luminance))
+            
+            _, labels, centers = cv2.kmeans(
+                logo_lum_flat,
+                actual_layers,
+                None,
+                criteria,
+                10,
+                cv2.KMEANS_PP_CENTERS
+            )
+            
+            optimal_layers = actual_layers
+            
+            # Sort by luminance
+            center_order = np.argsort(centers.flatten())
+            label_to_rank = {old: rank for rank, old in enumerate(center_order)}
         
         # ============================================================
-        # STEP 5: GENERATE OUTPUT COLORS (DIFFERENT STEPS!)
+        # STEP 7: GENERATE OUTPUT COLORS
         # ============================================================
         
         output_colors = []
         
         if print_color == 'white':
-            # WHITE PRINT: 10% steps (subtle gradation)
-            # Lightest original → 100% white (fill)
-            # Darker originals → graduated lighter grays
-            
+            # White print: 10% steps, all shades of white
             for i in range(optimal_layers):
-                # Reverse mapping: darkest original = most contrast from fill
                 shade_index = optimal_layers - 1 - i
-                darkness_percent = shade_index * white_step  # 0%, 10%, 20%, 30%...
+                darkness_percent = shade_index * white_step
+                darkness_percent = min(darkness_percent, 50)  # Max 50% dark
                 
-                # Calculate gray value (255 = white, lower = darker)
                 gray_value = int(255 * (100 - darkness_percent) / 100)
-                gray_value = max(150, gray_value)  # Never darker than rgb(150,150,150)
+                gray_value = max(128, gray_value)  # Never darker than 50% gray
                 
                 output_colors.append([gray_value, gray_value, gray_value])
             
-            # Ensure lightest layer (fill) is pure white
-            output_colors[-1] = [255, 255, 255]
-            
-        else:  # print_color == 'black'
-            # BLACK PRINT: 33% steps (stronger gradation)
-            # Darkest original → 100% black (fill)
-            # Lighter originals → graduated darker grays
-            
+            # Lightest = pure white (fill)
+            if optimal_layers > 0:
+                output_colors[-1] = [255, 255, 255]
+                
+        else:  # black
+            # Black print: 33% steps, all shades of black
             for i in range(optimal_layers):
-                lightness_percent = i * black_step  # 0%, 33%, 66%, 99%...
-                lightness_percent = min(lightness_percent, 90)  # Cap at 90%
+                lightness_percent = i * black_step
+                lightness_percent = min(lightness_percent, 85)  # Max 85% light
                 
-                # Calculate gray value (0 = black, higher = lighter)
                 gray_value = int(255 * lightness_percent / 100)
-                gray_value = min(230, gray_value)  # Never lighter than rgb(230,230,230)
+                gray_value = min(220, gray_value)  # Never lighter than ~85% white
                 
                 output_colors.append([gray_value, gray_value, gray_value])
             
-            # Ensure darkest layer (fill) is pure black
-            output_colors[0] = [0, 0, 0]
+            # Darkest = pure black (fill)
+            if optimal_layers > 0:
+                output_colors[0] = [0, 0, 0]
         
         # ============================================================
-        # STEP 6: BUILD OUTPUT IMAGE
+        # STEP 8: BUILD OUTPUT IMAGE - PRESERVE EVERYTHING
         # ============================================================
         
         result = np.zeros((height, width, 4), dtype=np.uint8)
         
         # Background = transparent
-        result[bg_mask] = [0, 0, 0, 0]
+        result[bg_mask, 3] = 0
         
-        # Map logo pixels
-        logo_indices = np.where(logo_mask)
-        logo_y = logo_indices[0]
-        logo_x = logo_indices[1]
-        
+        # Map each logo pixel to output color
         for i, (y, x) in enumerate(zip(logo_y, logo_x)):
-            original_label = labels[i][0]
-            rank = label_to_rank[original_label]
+            if optimal_layers == 1:
+                rank = 0
+            else:
+                original_label = labels[i][0]
+                rank = label_to_rank[original_label]
             
-            color = output_colors[rank]
-            result[y, x] = [color[0], color[1], color[2], 255]
+            color = output_colors[min(rank, len(output_colors)-1)]
+            
+            # PRESERVE ORIGINAL ALPHA for anti-aliasing!
+            pixel_alpha = original_alpha[y, x]
+            
+            result[y, x] = [color[0], color[1], color[2], pixel_alpha]
         
         # ============================================================
-        # STEP 7: OUTPUT
+        # STEP 9: OUTPUT
         # ============================================================
         
         result_img = Image.fromarray(result, 'RGBA')
@@ -360,7 +399,6 @@ def smart_print_ready():
         result_img.save(output, format='PNG', optimize=True)
         output.seek(0)
         
-        # Determine which step was used
         used_step = white_step if print_color == 'white' else black_step
         
         response = send_file(
@@ -376,13 +414,15 @@ def smart_print_ready():
         response.headers['X-Contrast-Step'] = f"{used_step}%"
         response.headers['X-Output-Colors'] = str(output_colors)
         response.headers['X-Logo-Pixels'] = str(len(logo_y))
+        response.headers['X-BG-Pixels-Removed'] = str(int(np.sum(bg_mask)))
+        response.headers['X-Preserve-All'] = str(preserve_all)
         
         return response
         
     except Exception as e:
         import traceback
         return jsonify({
-            "error": "Processing failed",
+            "error": "Processing failed", 
             "details": str(e),
             "traceback": traceback.format_exc()
         }), 500
@@ -391,7 +431,7 @@ def smart_print_ready():
 @app.route('/smart-print-ready/analyze', methods=['POST'])
 def smart_print_ready_analyze():
     """
-    Analyze logo - shows detected layers and expected output colors
+    Analyze logo without processing
     """
     auth_error = verify_api_key()
     if auth_error:
@@ -402,7 +442,8 @@ def smart_print_ready_analyze():
             return jsonify({"error": "No image file provided"}), 400
         
         file = request.files['image']
-        contrast_step = int(request.form.get('contrast_step', 15))
+        white_step = int(request.form.get('white_step', 10))
+        black_step = int(request.form.get('black_step', 33))
         
         img = Image.open(file.stream).convert('RGBA')
         data = np.array(img)
@@ -410,105 +451,106 @@ def smart_print_ready_analyze():
         
         r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
         
-        # Simple background detection
+        # Corner analysis
         corners = [data[0,0], data[0,-1], data[-1,0], data[-1,-1]]
-        avg_corner = np.mean([c[:3] for c in corners], axis=0)
-        avg_alpha = np.mean([c[3] for c in corners])
+        corner_colors = np.array([c[:3] for c in corners])
+        corner_alphas = np.array([c[3] for c in corners])
+        avg_corner = np.mean(corner_colors, axis=0)
+        avg_alpha = np.mean(corner_alphas)
+        corner_std = np.std(corner_colors)
         
         if avg_alpha < 128:
             bg_type = "transparent"
-        elif np.mean(avg_corner) > 235:
+        elif corner_std < 30 and np.mean(avg_corner) > 240:
             bg_type = "white"
-        elif np.mean(avg_corner) < 25:
+        elif corner_std < 30 and np.mean(avg_corner) < 15:
             bg_type = "black"
-        else:
+        elif corner_std < 30:
             bg_type = "colored"
+        else:
+            bg_type = "mixed/complex"
         
-        # Analyze luminance
+        # Luminance analysis
         luminance = 0.299 * r + 0.587 * g + 0.114 * b
-        logo_mask = a > 128
+        logo_mask = a > 10
         
-        if not np.any(logo_mask):
-            return jsonify({"error": "No logo content found"}), 400
+        if np.any(logo_mask):
+            logo_lum = luminance[logo_mask]
+            lum_min, lum_max = float(np.min(logo_lum)), float(np.max(logo_lum))
+            lum_range = lum_max - lum_min
+            lum_std = float(np.std(logo_lum))
+            
+            if lum_range < 30:
+                suggested_layers = 2
+            elif lum_range < 80:
+                suggested_layers = 3
+            elif lum_range < 150:
+                suggested_layers = 4
+            else:
+                suggested_layers = 5
+        else:
+            lum_min = lum_max = lum_range = lum_std = 0
+            suggested_layers = 2
         
-        logo_lum = luminance[logo_mask]
-        lum_min, lum_max = float(np.min(logo_lum)), float(np.max(logo_lum))
-        lum_std = float(np.std(logo_lum))
-        lum_range = lum_max - lum_min
-        
-        # Estimate layers
-        hist, bins = np.histogram(logo_lum, bins=32)
-        threshold = np.max(hist) * 0.1
-        peaks = 0
-        in_peak = False
-        for count in hist:
-            if count > threshold and not in_peak:
-                peaks += 1
-                in_peak = True
-            elif count <= threshold:
-                in_peak = False
-        
-        optimal_layers = max(2, min(5, peaks))
-        if lum_range < 50:
-            optimal_layers = 2
-        
-        # Generate expected output colors
+        # Generate expected colors
         white_colors = []
         black_colors = []
         
-        for i in range(optimal_layers):
-            # White print colors
-            shade_index = optimal_layers - 1 - i
-            darkness = shade_index * contrast_step
-            gray = max(180, int(255 - (255 * darkness / 100)))
+        for i in range(suggested_layers):
+            # White
+            shade_idx = suggested_layers - 1 - i
+            dark_pct = min(shade_idx * white_step, 50)
+            gray = max(128, int(255 * (100 - dark_pct) / 100))
             white_colors.append(f"rgb({gray},{gray},{gray})")
             
-            # Black print colors
-            lightness = i * contrast_step
-            gray = min(75, int(255 * lightness / 100))
+            # Black
+            light_pct = min(i * black_step, 85)
+            gray = min(220, int(255 * light_pct / 100))
             black_colors.append(f"rgb({gray},{gray},{gray})")
         
-        white_colors[-1] = "rgb(255,255,255) [FILL]"
-        black_colors[0] = "rgb(0,0,0) [FILL]"
+        if white_colors:
+            white_colors[-1] = "rgb(255,255,255) [FILL]"
+        if black_colors:
+            black_colors[0] = "rgb(0,0,0) [FILL]"
         
         return jsonify({
             "image": {
                 "dimensions": f"{width}x{height}",
-                "total_pixels": width * height
+                "total_pixels": width * height,
+                "non_transparent_pixels": int(np.sum(logo_mask))
             },
             "background": {
                 "type": bg_type,
-                "will_be_removed": True
+                "corner_color_avg": [int(c) for c in avg_corner],
+                "corner_alpha_avg": float(avg_alpha),
+                "corners_consistent": bool(corner_std < 30)
             },
-            "luminance_analysis": {
+            "luminance": {
                 "min": lum_min,
                 "max": lum_max,
                 "range": lum_range,
-                "std_dev": lum_std,
-                "histogram_peaks": peaks
+                "std_dev": lum_std
             },
-            "layer_detection": {
-                "recommended_layers": optimal_layers,
-                "reason": f"Found {peaks} distinct brightness levels, range={lum_range:.0f}"
+            "recommendation": {
+                "suggested_layers": suggested_layers,
+                "white_step": white_step,
+                "black_step": black_step
             },
             "expected_output": {
                 "white_print": {
-                    "description": "All shades of white/light gray, NO black",
-                    "colors_darkest_to_lightest": white_colors,
-                    "fill_color": "rgb(255,255,255)",
-                    "border_shades": f"Graduated by {contrast_step}% steps"
+                    "colors": white_colors,
+                    "step": f"{white_step}%",
+                    "note": "All shades of white, NO black"
                 },
                 "black_print": {
-                    "description": "All shades of black/dark gray, NO white",
-                    "colors_darkest_to_lightest": black_colors,
-                    "fill_color": "rgb(0,0,0)",
-                    "border_shades": f"Graduated by {contrast_step}% steps"
+                    "colors": black_colors,
+                    "step": f"{black_step}%",
+                    "note": "All shades of black, NO white"
                 }
             },
             "api_usage": {
-                "basic": "POST /smart-print-ready with print_color=white or black",
-                "custom_layers": f"Add layers={optimal_layers} to override auto-detection",
-                "custom_contrast": "Add contrast_step=10|15|20|25|30 to adjust shade difference"
+                "basic": "POST /smart-print-ready with image + print_color",
+                "example": f"print_color=white&layers={suggested_layers}&white_step={white_step}"
             }
         })
         
