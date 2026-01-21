@@ -108,79 +108,87 @@ def admin():
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
     """
-    🎯 ULTIMATE PRINT-READY CONVERSION v6
-    
-    - Darkest elements → PRIMARY print color (pure white/black)
-    - Gradients handled smoothly
-    - Lighter elements get graduated shades
-    
-    Parameters:
+    SMART PRINT-READY (Hybrid v7)
+    - Converts logo to print-ready grayscale (white or black scheme) with transparency preserved.
+    - Handles mixed logos: per connected-component decide Gradient vs Stepped Layers.
+    - Keeps your “group/layer” behavior for solid regions while avoiding ugly banding for gradients.
+
+    Params (form-data):
     - image: file (required)
-    - print_color: 'white' or 'black' (required)
-    - layers: 2-6 (default: 'auto')
-    - white_step: 5-30 (default: 10)
-    - black_step: 15-50 (default: 33)
-    - gradient_mode: 'smooth', 'stepped', 'auto' (default: 'auto')
+    - print_color: 'white' | 'black' (required)
+    - layers: 'auto' | 2..6 (default: 'auto')         # used for STEPPED components
+    - white_step: 5..30 (default: 10)                 # used for STEPPED components
+    - black_step: 15..50 (default: 33)                # used for STEPPED components
+    - gradient_mode: 'auto' | 'smooth' | 'stepped' (default: 'auto')
+        auto   = detect per component
+        smooth = force all components smooth
+        stepped= force all components stepped
     """
     auth_error = verify_api_key()
     if auth_error:
         return auth_error
-    
+
     try:
         if 'image' not in request.files:
             return jsonify({"error": "No image file provided"}), 400
-        
+
         file = request.files['image']
-        print_color = request.form.get('print_color', '').lower()
-        num_layers = request.form.get('layers', 'auto').lower()
+        print_color = request.form.get('print_color', '').lower().strip()
+        num_layers = request.form.get('layers', 'auto')
         white_step = int(request.form.get('white_step', 10))
         black_step = int(request.form.get('black_step', 33))
-        gradient_mode = request.form.get('gradient_mode', 'auto').lower()
-        
+        gradient_mode = request.form.get('gradient_mode', 'auto').lower().strip()
+
         if print_color not in ['white', 'black']:
             return jsonify({
                 "error": "print_color is required",
                 "usage": "print_color=white (for dark shirts) or print_color=black (for light shirts)"
             }), 400
-        
+
         white_step = max(5, min(30, white_step))
         black_step = max(15, min(50, black_step))
-        
+        if gradient_mode not in ['auto', 'smooth', 'stepped']:
+            gradient_mode = 'auto'
+
+        # ---------------------------
         # Load image
+        # ---------------------------
         img = Image.open(file.stream).convert('RGBA')
         data = np.array(img)
         height, width = data.shape[:2]
-        
-        r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
+
+        r = data[:, :, 0].astype(np.uint8)
+        g = data[:, :, 1].astype(np.uint8)
+        b = data[:, :, 2].astype(np.uint8)
+        a = data[:, :, 3].astype(np.uint8)
         original_alpha = a.copy()
-        
+
         # ============================================================
-        # STEP 1: BACKGROUND DETECTION
+        # STEP 1: BACKGROUND DETECTION (your logic, kept)
         # ============================================================
-        
         corners = [
             data[0, 0],
-            data[0, width-1],
-            data[height-1, 0],
-            data[height-1, width-1]
+            data[0, width - 1],
+            data[height - 1, 0],
+            data[height - 1, width - 1]
         ]
-        
-        corner_colors = np.array([c[:3] for c in corners])
-        corner_alphas = np.array([c[3] for c in corners])
-        
+
+        corner_colors = np.array([c[:3] for c in corners], dtype=np.float32)
+        corner_alphas = np.array([c[3] for c in corners], dtype=np.float32)
+
         avg_corner = np.mean(corner_colors, axis=0)
-        avg_alpha = np.mean(corner_alphas)
-        corner_std = np.std(corner_colors)
-        
+        avg_alpha = float(np.mean(corner_alphas))
+        corner_std = float(np.std(corner_colors))
+
         corners_consistent = corner_std < 30
-        
+
         if avg_alpha < 128:
             bg_type = "transparent"
             bg_mask = original_alpha < 10
-        elif corners_consistent and np.mean(avg_corner) > 240:
+        elif corners_consistent and float(np.mean(avg_corner)) > 240:
             bg_type = "white"
             bg_mask = (r > 250) & (g > 250) & (b > 250) & (original_alpha > 200)
-        elif corners_consistent and np.mean(avg_corner) < 15:
+        elif corners_consistent and float(np.mean(avg_corner)) < 15:
             bg_type = "black"
             bg_mask = (r < 5) & (g < 5) & (b < 5) & (original_alpha > 200)
         elif corners_consistent:
@@ -195,285 +203,277 @@ def smart_print_ready():
         else:
             bg_type = "mixed/none"
             bg_mask = original_alpha < 10
-        
+
+        # Always treat near-transparent as background
         bg_mask = bg_mask | (original_alpha < 10)
-        
-        # Flood fill from corners
+
+        # Flood fill from corners for non-transparent backgrounds
         if bg_type not in ["transparent", "mixed/none"]:
-            potential_bg = bg_mask.astype(np.uint8) * 255
+            potential_bg = (bg_mask.astype(np.uint8) * 255)
             connected_bg = np.zeros_like(potential_bg)
-            
-            for start_y, start_x in [(0, 0), (0, width-1), (height-1, 0), (height-1, width-1)]:
+
+            for start_y, start_x in [(0, 0), (0, width - 1), (height - 1, 0), (height - 1, width - 1)]:
                 if potential_bg[start_y, start_x] > 0:
-                    temp_mask = potential_bg.copy()
+                    temp = potential_bg.copy()
                     flood_mask = np.zeros((height + 2, width + 2), np.uint8)
-                    cv2.floodFill(temp_mask, flood_mask, (start_x, start_y), 128)
-                    connected_bg[temp_mask == 128] = 255
-            
+                    cv2.floodFill(temp, flood_mask, (start_x, start_y), 128)
+                    connected_bg[temp == 128] = 255
+
             bg_mask = connected_bg > 0
-        
-        logo_mask = ~bg_mask
-        logo_mask = logo_mask | (original_alpha > 10)
-        logo_mask = logo_mask & ~bg_mask
-        
-        logo_pixel_count = np.sum(logo_mask)
-        
-        if logo_pixel_count == 0:
+
+        # Logo mask (non-background, but keep alpha relevance)
+        logo_mask = (~bg_mask) & (original_alpha > 10)
+
+        if int(np.sum(logo_mask)) == 0:
+            # fallback: alpha-only
             logo_mask = original_alpha > 10
             bg_mask = ~logo_mask
             bg_type = "fallback-transparent-only"
-        
+
         # ============================================================
-        # STEP 2: CALCULATE LUMINANCE
+        # STEP 2: LUMINANCE
         # ============================================================
-        
-        luminance = (0.299 * r + 0.587 * g + 0.114 * b).astype(np.float32)
-        
-        logo_indices = np.where(logo_mask)
-        logo_y = logo_indices[0]
-        logo_x = logo_indices[1]
-        
-        if len(logo_y) == 0:
-            return jsonify({"error": "No logo pixels found"}), 400
-        
+        luminance = (0.299 * r.astype(np.float32) + 0.587 * g.astype(np.float32) + 0.114 * b.astype(np.float32))
+
         logo_luminance = luminance[logo_mask]
-        
-        lum_min = np.min(logo_luminance)
-        lum_max = np.max(logo_luminance)
-        lum_range = lum_max - lum_min
-        
+        if logo_luminance.size == 0:
+            return jsonify({"error": "No logo pixels found"}), 400
+
+        lum_min = float(np.min(logo_luminance))
+        lum_max = float(np.max(logo_luminance))
+        lum_range = float(lum_max - lum_min)
+
         # ============================================================
-        # STEP 3: DETECT GRADIENTS vs SOLID REGIONS (IMPROVED)
+        # STEP 3+4: HYBRID PER CONNECTED COMPONENT
         # ============================================================
-        
-        # Calculate local variance
-        kernel_size = 5
-        local_mean = cv2.blur(luminance, (kernel_size, kernel_size))
-        local_sq_mean = cv2.blur(luminance**2, (kernel_size, kernel_size))
-        local_variance = np.maximum(local_sq_mean - local_mean**2, 0)
-        
-        logo_local_var = local_variance[logo_mask]
-        avg_local_var = np.mean(logo_local_var)
-        
-        # Sobel gradient
-        sobel_x = cv2.Sobel(luminance, cv2.CV_32F, 1, 0, ksize=3)
-        sobel_y = cv2.Sobel(luminance, cv2.CV_32F, 0, 1, ksize=3)
-        gradient_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
-        
-        logo_gradient = gradient_magnitude[logo_mask]
-        avg_gradient = np.mean(logo_gradient)
-        
-        # Histogram analysis
-        hist, bin_edges = np.histogram(logo_luminance, bins=32)
-        hist_normalized = hist / (np.max(hist) + 1e-10)
-        
-        peaks = np.sum(hist_normalized > 0.15)
-        hist_spread = np.sum(hist_normalized > 0.05)
-        
-        # IMPROVED gradient detection
-        # Check for continuous spread vs distinct clusters
-        
-        # Count transitions in histogram (gaps between peaks)
-        significant_bins = hist_normalized > 0.08
-        transitions = np.sum(np.abs(np.diff(significant_bins.astype(int))))
-        
-        if gradient_mode == 'auto':
-            # Gradient indicators:
-            # 1. Wide histogram spread with few peaks
-            # 2. High local variance (smooth transitions)
-            # 3. Few histogram transitions (continuous distribution)
-            
-            is_gradient = False
-            
-            if hist_spread > 15 and peaks < 4 and transitions < 6:
-                is_gradient = True
-            elif avg_local_var > 500 and peaks < 5:
-                is_gradient = True
-            elif lum_range > 80 and hist_spread > 12 and peaks < 4:
-                is_gradient = True
-            
-            detected_gradient = is_gradient
-            
-        elif gradient_mode == 'smooth':
-            detected_gradient = True
-        else:
-            detected_gradient = False
-        
-        # ============================================================
-        # STEP 4: PROCESS BASED ON GRADIENT OR STEPPED
-        # ============================================================
-        
         result = np.zeros((height, width, 4), dtype=np.uint8)
         result[bg_mask] = [0, 0, 0, 0]
-        
-        if detected_gradient:
-            # ========== SMOOTH GRADIENT MAPPING ==========
-            processing_method = "smooth-gradient"
-            
-            # Normalize luminance to 0-1 range
-            if lum_range > 0:
-                normalized_lum = (logo_luminance - lum_min) / lum_range
-            else:
-                normalized_lum = np.zeros_like(logo_luminance)
-            
-            if print_color == 'white':
-                # DARKEST original → PURE WHITE (255)
-                # LIGHTEST original → darkest white shade
-                
-                out_max = 255  # Pure white for darkest elements
-                out_min = 160  # Lightest elements get this (still white-ish)
-                
-                # Invert: dark original (low normalized) → high output
-                output_values = out_max - normalized_lum * (out_max - out_min)
-                
-            else:  # black
-                # DARKEST original → PURE BLACK (0)
-                # LIGHTEST original → lightest black shade
-                
-                out_min = 0    # Pure black for darkest elements
-                out_max = 150  # Lightest elements get this (still dark)
-                
-                # Direct: dark original (low normalized) → low output (black)
-                output_values = out_min + normalized_lum * (out_max - out_min)
-            
-            output_values = np.clip(output_values, 0, 255).astype(np.uint8)
-            
-            for i, (y, x) in enumerate(zip(logo_y, logo_x)):
-                gray = int(output_values[i])
-                pixel_alpha = original_alpha[y, x]
-                result[y, x] = [gray, gray, gray, pixel_alpha]
-            
-            optimal_layers = "smooth"
-            output_colors = f"[{int(out_min)}...{int(out_max)}]"
-            
+
+        # Label connected components on logo pixels
+        mask_u8 = (logo_mask.astype(np.uint8) * 255)
+        num_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+
+        def _parse_layers(val):
+            if isinstance(val, str) and val.lower() == 'auto':
+                return 'auto'
+            try:
+                return max(2, min(6, int(val)))
+            except:
+                return 'auto'
+
+        layers_setting = _parse_layers(num_layers)
+
+        # --- gradient detection per component ---
+        def is_gradient_component(comp_bool: np.ndarray) -> bool:
+            # Respect explicit mode
+            if gradient_mode == 'smooth':
+                return True
+            if gradient_mode == 'stepped':
+                return False
+
+            # Remove edges (anti-alias) to avoid false detection
+            k = np.ones((3, 3), np.uint8)
+            interior = cv2.erode(comp_bool.astype(np.uint8), k, iterations=1).astype(bool)
+            if interior.sum() < 80:
+                interior = comp_bool  # fallback if too thin
+
+            lum_vals = luminance[interior].astype(np.float32)
+            if lum_vals.size < 140:
+                return False
+
+            # Histogram entropy (smooth gradients -> higher entropy, less dominance)
+            hist = np.histogram(lum_vals, bins=32)[0].astype(np.float32)
+            p = hist / (hist.sum() + 1e-9)
+            entropy = float(-np.sum(p * np.log(p + 1e-9)))
+            norm_entropy = entropy / float(np.log(len(p)))
+            dom_mass = float(np.sort(p)[-3:].sum())     # top-3 bin mass
+            occupancy = int(np.sum(hist > 0))
+
+            # Linear fit: lum ≈ ax + by + c (gradients often fit well)
+            ys, xs = np.where(interior)
+            X = np.column_stack([xs.astype(np.float32), ys.astype(np.float32), np.ones(xs.size, np.float32)])
+            yv = lum_vals
+            coef, *_ = np.linalg.lstsq(X, yv, rcond=None)
+            pred = X @ coef
+            ss_res = float(np.sum((yv - pred) ** 2))
+            ss_tot = float(np.sum((yv - float(yv.mean())) ** 2)) + 1e-9
+            r2 = 1.0 - (ss_res / ss_tot)
+
+            lum_std = float(lum_vals.std())
+            lum_rng = float(lum_vals.max() - lum_vals.min())
+
+            # Decision rules:
+            entropy_gradient = (norm_entropy > 0.70 and dom_mass < 0.55 and occupancy > 10 and lum_rng > 20)
+            linear_gradient = (r2 > 0.60 and lum_std > 8 and lum_rng > 20)
+
+            return bool(entropy_gradient or linear_gradient)
+
+        # Smooth gradient output range (more “solid” by default)
+        # If you want even MORE solid gradients: white 255..235, black 0..25
+        if print_color == 'white':
+            grad_out_max, grad_out_min = 255, 200
         else:
-            # ========== STEPPED LAYER MAPPING ==========
-            processing_method = "stepped-layers"
-            
-            # Determine layers
-            if num_layers == 'auto':
-                if lum_range < 30:
-                    optimal_layers = 2
-                elif lum_range < 80:
-                    optimal_layers = 3
-                elif lum_range < 150:
-                    optimal_layers = 4
+            grad_out_min, grad_out_max = 0, 70
+
+        stepped_components = 0
+        gradient_components = 0
+        used_gray_values = set()
+
+        # Process each component
+        for lab in range(1, num_cc):
+            area = int(cc_stats[lab, cv2.CC_STAT_AREA])
+            if area < 25:
+                continue
+
+            comp = (cc_labels == lab) & logo_mask
+            if int(np.sum(comp)) == 0:
+                continue
+
+            component_is_grad = is_gradient_component(comp)
+            if component_is_grad:
+                gradient_components += 1
+            else:
+                stepped_components += 1
+
+            ys, xs = np.where(comp)
+            comp_lum = luminance[ys, xs].astype(np.float32)
+            comp_alpha = original_alpha[ys, xs].astype(np.uint8)
+
+            if component_is_grad:
+                # -------- Smooth mapping (vectorized) --------
+                if lum_range > 1e-6:
+                    norm = (comp_lum - lum_min) / lum_range
                 else:
-                    optimal_layers = 5
+                    norm = np.zeros_like(comp_lum)
+
+                # Optional gentle gamma to reduce harsh contrast
+                norm = np.clip(norm, 0.0, 1.0) ** 1.1
+
+                if print_color == 'white':
+                    out = grad_out_max - norm * (grad_out_max - grad_out_min)
+                else:
+                    out = grad_out_min + norm * (grad_out_max - grad_out_min)
+
+                out = np.clip(out, 0, 255).astype(np.uint8)
+
+                result[ys, xs, 0] = out
+                result[ys, xs, 1] = out
+                result[ys, xs, 2] = out
+                result[ys, xs, 3] = comp_alpha
+
+                # track used grays (sampled, to avoid huge sets)
+                if out.size > 0:
+                    used_gray_values.update(np.unique(out[::max(1, out.size // 5000)]).tolist())
+
             else:
-                try:
-                    optimal_layers = int(num_layers)
-                    optimal_layers = max(2, min(6, optimal_layers))
-                except:
-                    optimal_layers = 3
-            
-            # K-means clustering
-            if lum_range < 10 or len(logo_luminance) < optimal_layers:
-                optimal_layers = 1
-                pixel_ranks = np.zeros(len(logo_luminance), dtype=np.int32)
-            else:
-                logo_lum_flat = logo_luminance.reshape(-1, 1).astype(np.float32)
-                
-                criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
-                actual_layers = min(optimal_layers, len(logo_luminance))
-                
-                _, labels, centers = cv2.kmeans(
-                    logo_lum_flat,
-                    actual_layers,
-                    None,
-                    criteria,
-                    10,
-                    cv2.KMEANS_PP_CENTERS
-                )
-                
-                optimal_layers = actual_layers
-                
-                # Sort centers: darkest (index 0) to lightest (index n-1)
-                center_order = np.argsort(centers.flatten())
-                label_to_rank = {old: rank for rank, old in enumerate(center_order)}
-                
-                pixel_ranks = np.array([label_to_rank[l[0]] for l in labels])
-            
-            # ========== GENERATE OUTPUT COLORS (FIXED LOGIC!) ==========
-            
-            output_colors = []
-            
-            if print_color == 'white':
-                # WHITE PRINT:
-                # Rank 0 (DARKEST original) → PURE WHITE (this is the main print!)
-                # Rank 1, 2, ... → progressively darker shades of white
-                
-                for rank in range(optimal_layers):
-                    if rank == 0:
-                        # Darkest original → PURE WHITE
-                        gray_value = 255
+                # -------- Stepped layers (per component kmeans) --------
+                comp_min = float(comp_lum.min())
+                comp_max = float(comp_lum.max())
+                comp_rng = float(comp_max - comp_min)
+
+                # Decide layers for this component
+                if layers_setting == 'auto':
+                    if comp_rng < 30:
+                        L = 2
+                    elif comp_rng < 80:
+                        L = 3
+                    elif comp_rng < 150:
+                        L = 4
                     else:
-                        # Each subsequent rank gets darker
-                        darkness_percent = rank * white_step
-                        darkness_percent = min(darkness_percent, 50)
-                        gray_value = int(255 * (100 - darkness_percent) / 100)
-                        gray_value = max(128, gray_value)
-                    
-                    output_colors.append([gray_value, gray_value, gray_value])
-                
-            else:  # black
-                # BLACK PRINT:
-                # Rank 0 (DARKEST original) → PURE BLACK (this is the main print!)
-                # Rank 1, 2, ... → progressively lighter shades of black
-                
-                for rank in range(optimal_layers):
-                    if rank == 0:
-                        # Darkest original → PURE BLACK
-                        gray_value = 0
-                    else:
-                        # Each subsequent rank gets lighter
-                        lightness_percent = rank * black_step
-                        lightness_percent = min(lightness_percent, 85)
-                        gray_value = int(255 * lightness_percent / 100)
-                        gray_value = min(220, gray_value)
-                    
-                    output_colors.append([gray_value, gray_value, gray_value])
-            
-            # Apply colors
-            for i, (y, x) in enumerate(zip(logo_y, logo_x)):
-                rank = pixel_ranks[i] if optimal_layers > 1 else 0
-                color = output_colors[min(rank, len(output_colors) - 1)]
-                pixel_alpha = original_alpha[y, x]
-                result[y, x] = [color[0], color[1], color[2], pixel_alpha]
-        
+                        L = 5
+                else:
+                    L = int(layers_setting)
+
+                # If too flat, keep as single tone
+                if comp_rng < 10 or comp_lum.size < L:
+                    L = 1
+                    ranks = np.zeros(comp_lum.size, dtype=np.int32)
+                else:
+                    Z = comp_lum.reshape(-1, 1).astype(np.float32)
+                    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+                    _, labels_k, centers = cv2.kmeans(Z, L, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+
+                    order = np.argsort(centers.flatten())  # darkest -> lightest
+                    lut = np.empty(L, dtype=np.int32)
+                    for rank, old in enumerate(order):
+                        lut[int(old)] = rank
+                    ranks = lut[labels_k.flatten()]
+
+                # Build output gray palette for this component
+                if print_color == 'white':
+                    grays = np.empty(L, dtype=np.uint8)
+                    for rank in range(L):
+                        if rank == 0:
+                            grays[rank] = 255
+                        else:
+                            darkness = min(rank * white_step, 50)
+                            v = int(255 * (100 - darkness) / 100)
+                            grays[rank] = max(128, v)
+                else:
+                    grays = np.empty(L, dtype=np.uint8)
+                    for rank in range(L):
+                        if rank == 0:
+                            grays[rank] = 0
+                        else:
+                            lightness = min(rank * black_step, 85)
+                            v = int(255 * lightness / 100)
+                            grays[rank] = min(220, v)
+
+                out = grays[np.clip(ranks, 0, L - 1)].astype(np.uint8)
+
+                result[ys, xs, 0] = out
+                result[ys, xs, 1] = out
+                result[ys, xs, 2] = out
+                result[ys, xs, 3] = comp_alpha
+
+                used_gray_values.update(grays.tolist())
+
+        # Extra safety fallback
+        if int(np.sum(result[:, :, 3] > 0)) == 0:
+            ys, xs = np.where(original_alpha > 10)
+            base = 255 if print_color == 'white' else 0
+            result[ys, xs, 0] = base
+            result[ys, xs, 1] = base
+            result[ys, xs, 2] = base
+            result[ys, xs, 3] = original_alpha[ys, xs]
+            bg_type = bg_type + "|fallback-filled"
+
         # ============================================================
         # STEP 5: OUTPUT
         # ============================================================
-        
         result_img = Image.fromarray(result, 'RGBA')
-        
         output = BytesIO()
         result_img.save(output, format='PNG', optimize=True)
         output.seek(0)
-        
+
         used_step = white_step if print_color == 'white' else black_step
-        
+
         response = send_file(
             output,
             mimetype='image/png',
             as_attachment=True,
             download_name=f'print_ready_{print_color}.png'
         )
-        
+
+        # Headers for debugging/telemetry
         response.headers['X-Print-Color'] = print_color.upper()
         response.headers['X-Background-Type'] = bg_type
-        response.headers['X-Processing-Method'] = processing_method
-        response.headers['X-Gradient-Detected'] = str(detected_gradient)
-        response.headers['X-Layers'] = str(optimal_layers)
+        response.headers['X-Processing-Method'] = "hybrid-components"
+        response.headers['X-Gradient-Mode'] = gradient_mode
+        response.headers['X-Gradient-Components'] = f"{gradient_components}/{max(1, (gradient_components + stepped_components))}"
+        response.headers['X-Stepped-Components'] = str(stepped_components)
         response.headers['X-Step'] = f"{used_step}%"
-        response.headers['X-Output-Colors'] = str(output_colors)
-        response.headers['X-Logo-Pixels'] = str(len(logo_y))
         response.headers['X-Luminance-Range'] = f"{lum_min:.0f}-{lum_max:.0f}"
-        response.headers['X-Histogram-Peaks'] = str(peaks)
-        response.headers['X-Histogram-Spread'] = str(hist_spread)
-        
+
+        # Keep this short so headers don’t explode
+        if used_gray_values:
+            sample = sorted(list(used_gray_values))
+            if len(sample) > 40:
+                sample = sample[:20] + ["..."] + sample[-20:]
+            response.headers['X-Used-Grays'] = str(sample)
+
         return response
-        
+
     except Exception as e:
         import traceback
         return jsonify({
