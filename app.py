@@ -108,10 +108,11 @@ def admin():
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
     """
-    🎯 ULTIMATE PRINT-READY CONVERSION v5
+    🎯 ULTIMATE PRINT-READY CONVERSION v6
     
-    Converts ALL colors to shades of target print_color.
-    PRESERVES all details and handles gradients smoothly.
+    - Darkest elements → PRIMARY print color (pure white/black)
+    - Gradients handled smoothly
+    - Lighter elements get graduated shades
     
     Parameters:
     - image: file (required)
@@ -154,7 +155,7 @@ def smart_print_ready():
         original_alpha = a.copy()
         
         # ============================================================
-        # STEP 1: BACKGROUND DETECTION (same as before)
+        # STEP 1: BACKGROUND DETECTION
         # ============================================================
         
         corners = [
@@ -242,119 +243,111 @@ def smart_print_ready():
         lum_range = lum_max - lum_min
         
         # ============================================================
-        # STEP 3: DETECT GRADIENTS vs SOLID REGIONS
+        # STEP 3: DETECT GRADIENTS vs SOLID REGIONS (IMPROVED)
         # ============================================================
         
-        # Calculate local variance using a small kernel
-        # High variance = edges/boundaries between solid colors
-        # Medium-low variance everywhere = gradient
+        # Calculate local variance
+        kernel_size = 5
+        local_mean = cv2.blur(luminance, (kernel_size, kernel_size))
+        local_sq_mean = cv2.blur(luminance**2, (kernel_size, kernel_size))
+        local_variance = np.maximum(local_sq_mean - local_mean**2, 0)
         
-        # Sobel gradient magnitude
+        logo_local_var = local_variance[logo_mask]
+        avg_local_var = np.mean(logo_local_var)
+        
+        # Sobel gradient
         sobel_x = cv2.Sobel(luminance, cv2.CV_32F, 1, 0, ksize=3)
         sobel_y = cv2.Sobel(luminance, cv2.CV_32F, 0, 1, ksize=3)
         gradient_magnitude = np.sqrt(sobel_x**2 + sobel_y**2)
         
-        # Local variance using box filter
-        kernel_size = 5
-        local_mean = cv2.blur(luminance, (kernel_size, kernel_size))
-        local_sq_mean = cv2.blur(luminance**2, (kernel_size, kernel_size))
-        local_variance = local_sq_mean - local_mean**2
-        local_variance = np.maximum(local_variance, 0)  # Ensure non-negative
+        logo_gradient = gradient_magnitude[logo_mask]
+        avg_gradient = np.mean(logo_gradient)
         
-        # Analyze gradient characteristics for logo pixels only
-        logo_gradient_mag = gradient_magnitude[logo_mask]
-        logo_local_var = local_variance[logo_mask]
-        
-        # Metrics for gradient detection
-        avg_gradient = np.mean(logo_gradient_mag)
-        max_gradient = np.max(logo_gradient_mag)
-        avg_local_var = np.mean(logo_local_var)
-        
-        # Histogram of luminance to detect distinct peaks (solid colors) vs spread (gradient)
+        # Histogram analysis
         hist, bin_edges = np.histogram(logo_luminance, bins=32)
-        hist_normalized = hist / np.max(hist)
+        hist_normalized = hist / (np.max(hist) + 1e-10)
         
-        # Count significant peaks (solid color regions)
-        peak_threshold = 0.15
-        peaks = np.sum(hist_normalized > peak_threshold)
+        peaks = np.sum(hist_normalized > 0.15)
+        hist_spread = np.sum(hist_normalized > 0.05)
         
-        # Gradient detection logic:
-        # - Few peaks + high avg_gradient = gradient
-        # - Many peaks + low avg_gradient = solid layers
-        # - Spread histogram = gradient
+        # IMPROVED gradient detection
+        # Check for continuous spread vs distinct clusters
         
-        hist_spread = np.sum(hist_normalized > 0.05)  # How many bins have significant pixels
+        # Count transitions in histogram (gaps between peaks)
+        significant_bins = hist_normalized > 0.08
+        transitions = np.sum(np.abs(np.diff(significant_bins.astype(int))))
         
         if gradient_mode == 'auto':
-            # Auto-detect based on characteristics
-            if hist_spread > 20 and peaks < 4:
-                # Wide spread, few peaks = likely gradient
-                detected_gradient = True
-            elif avg_gradient > 15 and peaks < 5:
-                # High average gradient, few peaks = likely gradient
-                detected_gradient = True
-            elif lum_range > 100 and peaks < 4:
-                # Large luminance range but few distinct peaks
-                detected_gradient = True
-            else:
-                detected_gradient = False
+            # Gradient indicators:
+            # 1. Wide histogram spread with few peaks
+            # 2. High local variance (smooth transitions)
+            # 3. Few histogram transitions (continuous distribution)
+            
+            is_gradient = False
+            
+            if hist_spread > 15 and peaks < 4 and transitions < 6:
+                is_gradient = True
+            elif avg_local_var > 500 and peaks < 5:
+                is_gradient = True
+            elif lum_range > 80 and hist_spread > 12 and peaks < 4:
+                is_gradient = True
+            
+            detected_gradient = is_gradient
+            
         elif gradient_mode == 'smooth':
             detected_gradient = True
-        else:  # 'stepped'
+        else:
             detected_gradient = False
         
         # ============================================================
-        # STEP 4: DETERMINE PROCESSING METHOD
+        # STEP 4: PROCESS BASED ON GRADIENT OR STEPPED
         # ============================================================
         
+        result = np.zeros((height, width, 4), dtype=np.uint8)
+        result[bg_mask] = [0, 0, 0, 0]
+        
         if detected_gradient:
-            # SMOOTH GRADIENT MAPPING
-            # Map luminance directly to output range without stepping
-            
+            # ========== SMOOTH GRADIENT MAPPING ==========
             processing_method = "smooth-gradient"
             
-            if print_color == 'white':
-                # Map: darkest → darkest_white, lightest → pure_white
-                # Darkest white = 128 (50% gray), lightest = 255
-                out_min = 128  # Darkest shade of "white"
-                out_max = 255  # Pure white
-            else:  # black
-                # Map: darkest → pure_black, lightest → lightest_black
-                out_min = 0    # Pure black
-                out_max = 180  # Lightest shade of "black"
-            
-            # Linear mapping for each pixel
+            # Normalize luminance to 0-1 range
             if lum_range > 0:
-                # Normalize luminance to 0-1
                 normalized_lum = (logo_luminance - lum_min) / lum_range
             else:
                 normalized_lum = np.zeros_like(logo_luminance)
             
             if print_color == 'white':
-                # Lighter original → lighter output (closer to 255)
-                output_values = out_min + normalized_lum * (out_max - out_min)
+                # DARKEST original → PURE WHITE (255)
+                # LIGHTEST original → darkest white shade
+                
+                out_max = 255  # Pure white for darkest elements
+                out_min = 160  # Lightest elements get this (still white-ish)
+                
+                # Invert: dark original (low normalized) → high output
+                output_values = out_max - normalized_lum * (out_max - out_min)
+                
             else:  # black
-                # Darker original → darker output (closer to 0)
+                # DARKEST original → PURE BLACK (0)
+                # LIGHTEST original → lightest black shade
+                
+                out_min = 0    # Pure black for darkest elements
+                out_max = 150  # Lightest elements get this (still dark)
+                
+                # Direct: dark original (low normalized) → low output (black)
                 output_values = out_min + normalized_lum * (out_max - out_min)
             
-            output_values = output_values.astype(np.uint8)
-            
-            # Build result
-            result = np.zeros((height, width, 4), dtype=np.uint8)
-            result[bg_mask] = [0, 0, 0, 0]
+            output_values = np.clip(output_values, 0, 255).astype(np.uint8)
             
             for i, (y, x) in enumerate(zip(logo_y, logo_x)):
-                gray = output_values[i]
+                gray = int(output_values[i])
                 pixel_alpha = original_alpha[y, x]
                 result[y, x] = [gray, gray, gray, pixel_alpha]
             
-            # For response headers
             optimal_layers = "smooth"
-            output_colors = f"[{out_min}...{out_max}]"
+            output_colors = f"[{int(out_min)}...{int(out_max)}]"
             
         else:
-            # STEPPED LAYER MAPPING (original method)
-            
+            # ========== STEPPED LAYER MAPPING ==========
             processing_method = "stepped-layers"
             
             # Determine layers
@@ -375,10 +368,9 @@ def smart_print_ready():
                     optimal_layers = 3
             
             # K-means clustering
-            if lum_range < 10:
+            if lum_range < 10 or len(logo_luminance) < optimal_layers:
                 optimal_layers = 1
-                labels = np.zeros((len(logo_luminance), 1), dtype=np.int32)
-                label_to_rank = {0: 0}
+                pixel_ranks = np.zeros(len(logo_luminance), dtype=np.int32)
             else:
                 logo_lum_flat = logo_luminance.reshape(-1, 1).astype(np.float32)
                 
@@ -395,53 +387,58 @@ def smart_print_ready():
                 )
                 
                 optimal_layers = actual_layers
+                
+                # Sort centers: darkest (index 0) to lightest (index n-1)
                 center_order = np.argsort(centers.flatten())
                 label_to_rank = {old: rank for rank, old in enumerate(center_order)}
+                
+                pixel_ranks = np.array([label_to_rank[l[0]] for l in labels])
             
-            # Generate output colors
+            # ========== GENERATE OUTPUT COLORS (FIXED LOGIC!) ==========
+            
             output_colors = []
             
             if print_color == 'white':
-                for i in range(optimal_layers):
-                    shade_index = optimal_layers - 1 - i
-                    darkness_percent = shade_index * white_step
-                    darkness_percent = min(darkness_percent, 50)
-                    
-                    gray_value = int(255 * (100 - darkness_percent) / 100)
-                    gray_value = max(128, gray_value)
+                # WHITE PRINT:
+                # Rank 0 (DARKEST original) → PURE WHITE (this is the main print!)
+                # Rank 1, 2, ... → progressively darker shades of white
+                
+                for rank in range(optimal_layers):
+                    if rank == 0:
+                        # Darkest original → PURE WHITE
+                        gray_value = 255
+                    else:
+                        # Each subsequent rank gets darker
+                        darkness_percent = rank * white_step
+                        darkness_percent = min(darkness_percent, 50)
+                        gray_value = int(255 * (100 - darkness_percent) / 100)
+                        gray_value = max(128, gray_value)
                     
                     output_colors.append([gray_value, gray_value, gray_value])
                 
-                if optimal_layers > 0:
-                    output_colors[-1] = [255, 255, 255]
-                    
             else:  # black
-                for i in range(optimal_layers):
-                    lightness_percent = i * black_step
-                    lightness_percent = min(lightness_percent, 85)
-                    
-                    gray_value = int(255 * lightness_percent / 100)
-                    gray_value = min(220, gray_value)
+                # BLACK PRINT:
+                # Rank 0 (DARKEST original) → PURE BLACK (this is the main print!)
+                # Rank 1, 2, ... → progressively lighter shades of black
+                
+                for rank in range(optimal_layers):
+                    if rank == 0:
+                        # Darkest original → PURE BLACK
+                        gray_value = 0
+                    else:
+                        # Each subsequent rank gets lighter
+                        lightness_percent = rank * black_step
+                        lightness_percent = min(lightness_percent, 85)
+                        gray_value = int(255 * lightness_percent / 100)
+                        gray_value = min(220, gray_value)
                     
                     output_colors.append([gray_value, gray_value, gray_value])
-                
-                if optimal_layers > 0:
-                    output_colors[0] = [0, 0, 0]
             
-            # Build result
-            result = np.zeros((height, width, 4), dtype=np.uint8)
-            result[bg_mask, 3] = 0
-            
+            # Apply colors
             for i, (y, x) in enumerate(zip(logo_y, logo_x)):
-                if optimal_layers == 1:
-                    rank = 0
-                else:
-                    original_label = labels[i][0]
-                    rank = label_to_rank[original_label]
-                
-                color = output_colors[min(rank, len(output_colors)-1)]
+                rank = pixel_ranks[i] if optimal_layers > 1 else 0
+                color = output_colors[min(rank, len(output_colors) - 1)]
                 pixel_alpha = original_alpha[y, x]
-                
                 result[y, x] = [color[0], color[1], color[2], pixel_alpha]
         
         # ============================================================
@@ -471,9 +468,9 @@ def smart_print_ready():
         response.headers['X-Step'] = f"{used_step}%"
         response.headers['X-Output-Colors'] = str(output_colors)
         response.headers['X-Logo-Pixels'] = str(len(logo_y))
+        response.headers['X-Luminance-Range'] = f"{lum_min:.0f}-{lum_max:.0f}"
         response.headers['X-Histogram-Peaks'] = str(peaks)
         response.headers['X-Histogram-Spread'] = str(hist_spread)
-        response.headers['X-Avg-Gradient'] = f"{avg_gradient:.2f}"
         
         return response
         
