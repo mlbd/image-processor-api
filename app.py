@@ -105,6 +105,466 @@ def admin():
         "coffee_level": f"{random.randint(60, 100)}%"
     })
 
+@app.route('/smart-logo-variant', methods=['POST'])
+def smart_logo_variant():
+    """
+    SMART LOGO VARIANT (AUTO v1) — no params, self-deciding
+
+    What it does (automatically, per logo):
+    - Always returns a visually different variant (never identical output)
+    - Converts DARK-ish SOLID details into WHITE-ish tones (print-friendly)
+    - Preserves touching border/layer separation by assigning multiple white-ish shades (255, 235, 215...)
+    - Protects gradients: gradient pixels are left untouched (even inside a larger component)
+    - Prevents “lost” design (e.g., black letter on white badge) using contrast-guard:
+        -> if needed, invert that solid component (badge becomes dark, letter becomes white)
+        -> or add an internal separator ring
+    - If changes are too small (e.g., Google logo has no dark-ish), adds an OUTER outline ring (outside logo pixels)
+      so the output is still clearly “a new version”, while keeping all original logo colors intact.
+
+    Input:
+      - multipart/form-data with 'image' file
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+
+        # ---------------------------
+        # Load image
+        # ---------------------------
+        img = Image.open(file.stream).convert('RGBA')
+        data = np.array(img)
+        height, width = data.shape[:2]
+
+        r = data[:, :, 0].astype(np.uint8)
+        g = data[:, :, 1].astype(np.uint8)
+        b = data[:, :, 2].astype(np.uint8)
+        a = data[:, :, 3].astype(np.uint8)
+        original_alpha = a.copy()
+
+        # Fast color helpers
+        max_rgb = np.maximum(np.maximum(r, g), b).astype(np.uint8)
+        min_rgb = np.minimum(np.minimum(r, g), b).astype(np.uint8)
+        chroma = (max_rgb.astype(np.int16) - min_rgb.astype(np.int16)).astype(np.int16)
+
+        luminance = (0.299 * r.astype(np.float32) +
+                     0.587 * g.astype(np.float32) +
+                     0.114 * b.astype(np.float32))
+
+        # ---------------------------
+        # AUTO constants (no user params)
+        # ---------------------------
+        alpha_min = 10  # treat <= as transparent background
+
+        # "changed too little" => add outer outline
+        min_change_ratio = 0.008  # ~0.8%
+
+        # Contrast guard (if new white-ish becomes too close to its neighbor brightness)
+        contrast_delta = 35
+
+        # Outline size is auto based on image size
+        outline_px = int(max(2, min(6, round(min(height, width) * 0.004))))
+        outline_alpha = 220
+
+        # ---------------------------
+        # STEP 1: Background detection (same spirit as your other endpoints)
+        # ---------------------------
+        corners = [
+            data[0, 0], data[0, width - 1],
+            data[height - 1, 0], data[height - 1, width - 1]
+        ]
+        corner_rgb = np.array([c[:3] for c in corners], dtype=np.float32)
+        corner_a = np.array([c[3] for c in corners], dtype=np.float32)
+
+        avg_corner = np.mean(corner_rgb, axis=0)
+        avg_alpha = float(np.mean(corner_a))
+        corner_std = float(np.std(corner_rgb))
+        corners_consistent = corner_std < 30
+
+        bg_mask = (original_alpha <= alpha_min)
+        bg_type = "transparent" if avg_alpha < 128 else "mixed/none"
+
+        if avg_alpha > 200 and corners_consistent:
+            mean_corner = float(np.mean(avg_corner))
+            tolerance = 20
+
+            if mean_corner > 240:
+                bg_type = "white"
+                bg_mask = bg_mask | ((r > 250) & (g > 250) & (b > 250) & (original_alpha > 200))
+            elif mean_corner < 15:
+                bg_type = "black"
+                bg_mask = bg_mask | ((r < 5) & (g < 5) & (b < 5) & (original_alpha > 200))
+            else:
+                bg_type = "colored"
+                bg_mask = bg_mask | (
+                    (np.abs(r.astype(np.int16) - int(avg_corner[0])) < tolerance) &
+                    (np.abs(g.astype(np.int16) - int(avg_corner[1])) < tolerance) &
+                    (np.abs(b.astype(np.int16) - int(avg_corner[2])) < tolerance) &
+                    (original_alpha > 200)
+                )
+
+            # Flood fill from corners to keep only connected background
+            potential_bg = (bg_mask.astype(np.uint8) * 255)
+            connected_bg = np.zeros_like(potential_bg)
+
+            for sy, sx in [(0, 0), (0, width - 1), (height - 1, 0), (height - 1, width - 1)]:
+                if potential_bg[sy, sx] > 0:
+                    tmp = potential_bg.copy()
+                    flood = np.zeros((height + 2, width + 2), np.uint8)
+                    cv2.floodFill(tmp, flood, (sx, sy), 128)
+                    connected_bg[tmp == 128] = 255
+
+            bg_mask = connected_bg > 0
+
+        logo_mask = (~bg_mask) & (original_alpha > alpha_min)
+        if int(np.sum(logo_mask)) == 0:
+            logo_mask = (original_alpha > alpha_min)
+            bg_mask = ~logo_mask
+            bg_type = "fallback-transparent-only"
+
+        logo_px = int(np.sum(logo_mask))
+        if logo_px == 0:
+            return jsonify({"error": "No logo pixels found"}), 400
+
+        # ---------------------------
+        # Precompute gradient signals (global) for pixel-level gradient protection
+        # ---------------------------
+        # Local variance on luminance (5x5)
+        ksize = 5
+        local_mean = cv2.blur(luminance, (ksize, ksize))
+        local_sq_mean = cv2.blur(luminance * luminance, (ksize, ksize))
+        local_var = np.maximum(local_sq_mean - local_mean * local_mean, 0.0)
+
+        # Sobel gradient magnitude
+        sobel_x = cv2.Sobel(luminance, cv2.CV_32F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(luminance, cv2.CV_32F, 0, 1, ksize=3)
+        gradmag = np.sqrt(sobel_x * sobel_x + sobel_y * sobel_y)
+
+        # ---------------------------
+        # STEP 2: Connected components on logo pixels
+        # ---------------------------
+        mask_u8 = (logo_mask.astype(np.uint8) * 255)
+        num_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+
+        result = data.copy()
+        changed = np.zeros((height, width), dtype=bool)
+
+        gradient_px_total = 0
+        solid_px_total = 0
+        inverted_components = 0
+        inner_ring_components = 0
+
+        # Helper: small deterministic kmeans 1D
+        def kmeans_1d(values: np.ndarray, K: int):
+            N = int(values.size)
+            if N <= 0:
+                return np.zeros((0,), dtype=np.int32), np.zeros((0,), dtype=np.float32)
+
+            if K <= 1 or N < K:
+                return np.zeros((N,), dtype=np.int32), np.array([float(values.mean())], dtype=np.float32)
+
+            Z = values.reshape(-1, 1).astype(np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+            _, labels, centers = cv2.kmeans(Z, K, None, criteria, 10, cv2.KMEANS_PP_CENTERS)
+            return labels.flatten().astype(np.int32), centers.flatten().astype(np.float32)
+
+        def build_white_ramp(n: int):
+            # auto-separated whites: 255 down to a floor that still looks "white-ish"
+            if n <= 1:
+                return np.array([255], dtype=np.uint8)
+            desired_step = 22  # good separation without looking too dark
+            floor = max(170, 255 - desired_step * (n - 1))
+            ramp = np.linspace(255, floor, n).round().astype(np.int16)
+
+            # enforce min delta
+            min_delta = 10
+            for i in range(1, n):
+                if ramp[i] > ramp[i - 1] - min_delta:
+                    ramp[i] = max(170, ramp[i - 1] - min_delta)
+
+            return np.clip(ramp, 0, 255).astype(np.uint8)
+
+        # ============================================================
+        # STEP 3: Per component
+        #   - Build pixel-level gradient mask (inside component)
+        #   - Process only solid pixels (component - gradient_pixels)
+        # ============================================================
+        for lab in range(1, num_cc):
+            area = int(cc_stats[lab, cv2.CC_STAT_AREA])
+            if area < 25:
+                continue
+
+            comp = (cc_labels == lab) & logo_mask
+            comp_px = int(comp.sum())
+            if comp_px == 0:
+                continue
+
+            # ---- Build interior (to avoid edge false gradient detection) ----
+            k3 = np.ones((3, 3), np.uint8)
+            interior = cv2.erode(comp.astype(np.uint8), k3, iterations=1).astype(bool)
+            if int(interior.sum()) < 120:
+                interior = comp
+
+            # ---- Pixel-level gradient detection inside this component ----
+            gm_vals = gradmag[interior]
+            var_vals = local_var[interior]
+
+            gradient_mask = np.zeros((height, width), dtype=bool)
+
+            if gm_vals.size >= 200:
+                # Adaptive thresholds (high percentiles)
+                gm_p85 = float(np.percentile(gm_vals, 85))
+                var_p85 = float(np.percentile(var_vals, 85))
+
+                gm_thresh = max(6.0, gm_p85)
+                var_thresh = max(30.0, var_p85 * 0.60)
+
+                grad_core = interior & (gradmag > gm_thresh) & (local_var > var_thresh)
+
+                # Only treat as gradient region if it’s a meaningful chunk (not just edges)
+                grad_ratio = float(grad_core.sum()) / float(max(1, interior.sum()))
+                if grad_ratio > 0.08:
+                    # Expand a bit to cover the gradient body
+                    grad_body = cv2.dilate(grad_core.astype(np.uint8), k3, iterations=1).astype(bool)
+                    gradient_mask = grad_body & comp
+
+            solid = comp & (~gradient_mask)
+            solid_px = int(solid.sum())
+            if solid_px < 25:
+                gradient_px_total += int(gradient_mask.sum())
+                continue
+
+            gradient_px_total += int(gradient_mask.sum())
+            solid_px_total += solid_px
+
+            # ---- Extract solid pixel features ----
+            ys, xs = np.where(solid)
+            lum_s = luminance[ys, xs].astype(np.float32)
+            v_s = max_rgb[ys, xs].astype(np.float32)
+            c_s = chroma[ys, xs].astype(np.float32)
+
+            lum_min = float(lum_s.min())
+            lum_max = float(lum_s.max())
+            lum_rng = float(lum_max - lum_min)
+
+            # Is this solid region mostly grayscale-ish?
+            # (If yes, we can safely treat touching borders/layers using luminance clustering.)
+            grayish = (float(np.percentile(c_s, 60)) < 22.0)
+
+            # ---- Choose K automatically ----
+            if solid_px < 250:
+                K = 2
+            else:
+                if lum_rng < 18:
+                    K = 2
+                elif lum_rng < 55:
+                    K = 3
+                elif lum_rng < 110:
+                    K = 4
+                else:
+                    K = 5
+
+            K = int(min(6, max(2, K)))
+            if solid_px < K:
+                K = 2
+
+            # ---- Kmeans on luminance (solid pixels only) ----
+            labels, centers = kmeans_1d(lum_s, K)
+            if centers.size == 0:
+                continue
+
+            # Sort centers: darkest -> lightest
+            order = np.argsort(centers)
+            inv_order = np.empty_like(order)
+            for rank, old in enumerate(order):
+                inv_order[int(old)] = rank
+            ranks = inv_order[labels]  # 0..K-1 (dark..light)
+            centers_sorted = centers[order]
+
+            # ---- Compute per-rank mean V and chroma to avoid converting colored solids ----
+            rank_mean_v = np.zeros(K, dtype=np.float32)
+            rank_mean_c = np.zeros(K, dtype=np.float32)
+            rank_counts = np.zeros(K, dtype=np.int32)
+
+            for rk in range(K):
+                m = (ranks == rk)
+                cnt = int(np.sum(m))
+                rank_counts[rk] = cnt
+                if cnt > 0:
+                    rank_mean_v[rk] = float(np.mean(v_s[m]))
+                    rank_mean_c[rk] = float(np.mean(c_s[m]))
+                else:
+                    rank_mean_v[rk] = 255.0
+                    rank_mean_c[rk] = 255.0
+
+            # ---- Decide which ranks to convert (AUTO) ----
+            # Anchor black: do we have true dark "ink" present?
+            anchor_black = (float(np.percentile(v_s, 2)) < 35.0)
+
+            # If anchor_black exists, include multiple dark layers (core + borders)
+            # Otherwise be conservative (only very dark grayscale-like ranks).
+            if anchor_black:
+                lum_cut = min(160.0, lum_min + max(45.0, 0.60 * lum_rng))
+                # Allow grayscale borders even if not pure black
+                convertible = []
+                for rk in range(K):
+                    if centers_sorted[rk] <= lum_cut:
+                        if grayish:
+                            convertible.append(rk)
+                        else:
+                            # for colored components: only convert truly "dark+low-chroma"
+                            if (rank_mean_v[rk] <= 90.0) and (rank_mean_c[rk] <= 70.0):
+                                convertible.append(rk)
+            else:
+                # No strong black anchor: only convert ranks that are truly "dark-ish gray"
+                convertible = []
+                for rk in range(K):
+                    if (rank_mean_v[rk] <= 70.0) and (rank_mean_c[rk] <= 70.0):
+                        convertible.append(rk)
+
+            # Remove tiny ranks (noise)
+            convertible = [rk for rk in convertible if rank_counts[rk] >= 18]
+
+            if not convertible:
+                continue
+
+            convertible = sorted(convertible)  # already dark->lighter order by rk
+            ramp = build_white_ramp(len(convertible))
+
+            rank_to_gray = np.full(K, -1, dtype=np.int16)
+            for i, rk in enumerate(convertible):
+                rank_to_gray[int(rk)] = int(ramp[i])
+
+            new_gray = rank_to_gray[ranks]  # per pixel, -1 for untouched
+            sel = (new_gray >= 0)
+            if not np.any(sel):
+                continue
+
+            ys_sel = ys[sel]
+            xs_sel = xs[sel]
+            out_gray = new_gray[sel].astype(np.uint8)
+
+            # Apply: convert selected solid pixels to white-ish grayscale
+            result[ys_sel, xs_sel, 0] = out_gray
+            result[ys_sel, xs_sel, 1] = out_gray
+            result[ys_sel, xs_sel, 2] = out_gray
+            result[ys_sel, xs_sel, 3] = original_alpha[ys_sel, xs_sel]
+            changed[ys_sel, xs_sel] = True
+
+            # ---- Contrast guard: if we just whitened something on a bright neighbor, it can disappear ----
+            changed_comp = np.zeros((height, width), dtype=bool)
+            changed_comp[ys_sel, xs_sel] = True
+
+            dil = cv2.dilate(changed_comp.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=1).astype(bool)
+            neighbor = dil & solid & (~changed_comp)
+            if int(neighbor.sum()) < 30:
+                neighbor = solid & (~changed_comp)
+
+            neighbor_mean = float(np.mean(luminance[neighbor])) if int(neighbor.sum()) > 0 else float(np.mean(lum_s))
+            out_mean = float(np.mean(out_gray)) if out_gray.size > 0 else 255.0
+
+            if abs(out_mean - neighbor_mean) < float(contrast_delta):
+                # Try “BW-ish invert” only when it’s basically a B/W badge-like component AND not gradient-heavy
+                comp_grad_ratio = float(gradient_mask.sum()) / float(max(1, comp_px))
+
+                # auto BW test on SOLID pixels
+                v5 = float(np.percentile(v_s, 5))
+                v95 = float(np.percentile(v_s, 95))
+                black_cut = min(60.0, v5 + 10.0)
+                white_cut = max(220.0, v95 - 5.0)
+
+                bw = ((v_s <= black_cut) | (v_s >= white_cut))
+                bw_ratio = float(np.mean(bw)) if bw.size > 0 else 0.0
+
+                if (bw_ratio > 0.85) and (comp_grad_ratio < 0.05):
+                    # Invert SOLID pixels by rank: dark -> white, light -> black
+                    inv_palette = np.linspace(255, 0, K).round().astype(np.uint8)
+                    inv = inv_palette[ranks].astype(np.uint8)
+
+                    result[ys, xs, 0] = inv
+                    result[ys, xs, 1] = inv
+                    result[ys, xs, 2] = inv
+                    result[ys, xs, 3] = original_alpha[ys, xs]
+                    changed[ys, xs] = True
+                    inverted_components += 1
+                else:
+                    # Add an internal separator ring around the changed region
+                    ring = cv2.dilate(changed_comp.astype(np.uint8), k3, iterations=1).astype(bool) & solid & (~changed_comp)
+                    if int(ring.sum()) > 0:
+                        result[ring, 0] = 0
+                        result[ring, 1] = 0
+                        result[ring, 2] = 0
+                        result[ring, 3] = original_alpha[ring]
+                        changed[ring] = True
+                        inner_ring_components += 1
+
+        # ============================================================
+        # STEP 4: Ensure output is always different (fallback OUTER outline)
+        #   - does not modify logo pixels => gradients remain untouched
+        # ============================================================
+        changed_px = int(np.sum(changed & logo_mask))
+        changed_ratio = float(changed_px) / float(max(1, logo_px))
+
+        fallback_outline = False
+        if changed_ratio < min_change_ratio:
+            # Outline ring outside logo silhouette
+            k = np.ones((3, 3), np.uint8)
+            dil = cv2.dilate(logo_mask.astype(np.uint8), k, iterations=outline_px).astype(bool)
+            ring = dil & (~logo_mask)
+
+            # Outline color: pick contrast vs corner brightness
+            corner_brightness = float(np.mean(avg_corner))
+            outline_gray = 0 if corner_brightness > 160 else 255
+
+            result[ring, 0] = outline_gray
+            result[ring, 1] = outline_gray
+            result[ring, 2] = outline_gray
+            result[ring, 3] = np.maximum(result[ring, 3].astype(np.uint8), np.uint8(outline_alpha))
+
+            fallback_outline = True
+
+        # ============================================================
+        # OUTPUT
+        # ============================================================
+        out_img = Image.fromarray(result, 'RGBA')
+        output = BytesIO()
+        out_img.save(output, format='PNG', optimize=True)
+        output.seek(0)
+
+        response = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name='smart_logo_variant.png'
+        )
+
+        # Debug headers (telemetry)
+        response.headers['X-Background-Type'] = bg_type
+        response.headers['X-Changed-Ratio'] = f"{changed_ratio:.4f}"
+        response.headers['X-Fallback-Outline'] = str(fallback_outline)
+        response.headers['X-Outline-Px'] = str(outline_px)
+        response.headers['X-Gradient-Pixels'] = str(int(gradient_px_total))
+        response.headers['X-Solid-Pixels'] = str(int(solid_px_total))
+        response.headers['X-Inverted-Components'] = str(int(inverted_components))
+        response.headers['X-Inner-Ring-Components'] = str(int(inner_ring_components))
+
+        return response
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
     """
