@@ -37,6 +37,8 @@ def home():
             "/health": "GET - Health check",
             "/smart-print-ready": "POST - 🎯 SMART print-ready conversion (RECOMMENDED)",
             "/smart-print-ready/analyze": "POST - Analyze logo before processing",
+            "/smart-logo-variant": "POST - Generate logo variant (outline fallback)",
+            "/gen-logo-variant": "POST - Generate logo variant (invert fallback)",
             "/force-solid-black": "POST - Force entire logo to solid black",
             "/force-solid-white": "POST - Force entire logo to solid white",
             "/replace-dark-to-white": "POST - Replace dark colors with white",
@@ -509,6 +511,7 @@ def smart_logo_variant():
             "traceback": traceback.format_exc()
         }), 500
 
+
 @app.route('/gen-logo-variant', methods=['POST'])
 def gen_logo_variant():
     """
@@ -860,6 +863,7 @@ def gen_logo_variant():
             "details": str(e),
             "traceback": traceback.format_exc()
         }), 500
+
 
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
