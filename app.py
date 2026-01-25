@@ -117,14 +117,18 @@ def smart_logo_variant():
 
     Priority:
       1) If dark-ish ratio > 30% (solid logo pixels):
-           -> heavy-dark-to-white (ONLY dark -> layered whites starting from pure white)
+           -> heavy-dark-to-white (ONLY dark -> layered whites)
       2) Else if tiny dark-ish + lots of white-ish:
            -> swap-bw (dark -> layered whites, white -> layered blacks)
       3) Else if has dark-ish:
            -> dark-to-white (dark -> layered whites)
       4) Else (no dark-ish):
-           -> stroke-variant (draw outer stroke around logo silhouette; keeps brand colors)
-              (on light bg: may also flip pure whites to blacks if safe, but stroke guarantees difference)
+           -> stroke-variant (outer stroke around logo silhouette; keeps brand colors)
+
+    Guarantee:
+      - If output is still unchanged after selected logic,
+        NEGATE (invert) the entire logo colors (logo only, background untouched).
+      - If still unchanged (very rare), fallback to stroke with stronger thickness.
 
     Output:
       - PNG
@@ -163,7 +167,7 @@ def smart_logo_variant():
         alpha_min = 10  # background/transparent cut
 
         # Decision ratios (fixed)
-        heavy_dark_cut   = 0.30  # ✅ your top priority
+        heavy_dark_cut   = 0.30  # top priority
         small_dark_ratio = 0.02  # tiny dark = 2%
         high_white_ratio = 0.40  # lots of white = 40%
 
@@ -184,7 +188,7 @@ def smart_logo_variant():
         a = data[:, :, 3].astype(np.uint8)
 
         # ============================================================
-        # STEP 1: Background detection (corner + floodfill like your endpoints)
+        # STEP 1: Background detection (corner + floodfill)
         # ============================================================
         corners = [data[0, 0], data[0, w - 1], data[h - 1, 0], data[h - 1, w - 1]]
         corner_rgb = np.array([c[:3] for c in corners], dtype=np.float32)
@@ -248,10 +252,9 @@ def smart_logo_variant():
         luminance = (0.299 * r.astype(np.float32) + 0.587 * g.astype(np.float32) + 0.114 * b.astype(np.float32))
 
         # ============================================================
-        # STEP 3: Gradient detection per component (same spirit as smart-print-ready)
+        # STEP 3: Gradient detection per component
         # ============================================================
         def is_gradient_component(comp_bool: np.ndarray) -> bool:
-            # remove edge pixels to avoid anti-alias false positives
             k = np.ones((3, 3), np.uint8)
             interior = cv2.erode(comp_bool.astype(np.uint8), k, iterations=1).astype(bool)
             if interior.sum() < 80:
@@ -285,7 +288,7 @@ def smart_logo_variant():
             return bool(entropy_gradient or linear_gradient)
 
         # ============================================================
-        # STEP 4: Solid-only mask for decision statistics (skip gradient components)
+        # STEP 4: Solid-only mask for decision stats (skip gradients)
         # ============================================================
         solid_logo_mask = np.zeros((h, w), dtype=bool)
         gradients_skipped = 0
@@ -307,7 +310,6 @@ def smart_logo_variant():
 
         solid_px = int(np.sum(solid_logo_mask))
         if solid_px == 0:
-            # if everything is gradient/tiny, fallback to logo_mask
             solid_logo_mask = logo_mask
             solid_px = int(np.sum(solid_logo_mask))
 
@@ -321,7 +323,7 @@ def smart_logo_variant():
         white_ratio = white_px / max(1, solid_px)
 
         # ============================================================
-        # STEP 5: Auto mode selection (with your priority)
+        # STEP 5: Auto mode selection
         # ============================================================
         if dark_ratio >= heavy_dark_cut:
             mode = "heavy-dark-to-white"
@@ -340,10 +342,6 @@ def smart_logo_variant():
         changed_pixels = 0
 
         def apply_layered_palette(target_mask: np.ndarray, to: str) -> int:
-            """
-            Quantize luminance in target_mask into 2..4 levels and map to palette.
-            to: 'white' or 'black'
-            """
             ys, xs = np.where(target_mask)
             if ys.size == 0:
                 return 0
@@ -351,7 +349,6 @@ def smart_logo_variant():
             lum = luminance[ys, xs].astype(np.float32)
             lum_rng = float(lum.max() - lum.min()) if lum.size else 0.0
 
-            # Choose K
             if lum.size < 600 or lum_rng < 18:
                 K = 2
             elif lum_rng < 60:
@@ -361,18 +358,16 @@ def smart_logo_variant():
             if lum.size < K:
                 K = 2
 
-            # KMeans on luminance
             Z = lum.reshape(-1, 1).astype(np.float32)
             criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.4)
             _, labels_k, centers = cv2.kmeans(Z, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
 
-            order = np.argsort(centers.flatten())  # darkest -> lightest
+            order = np.argsort(centers.flatten())
             lut = np.empty(K, dtype=np.int32)
             for rank, old in enumerate(order):
                 lut[int(old)] = rank
             ranks = lut[labels_k.flatten()]
 
-            # Palettes (separated layers)
             if to == 'white':
                 palette = [255, 235, 215, 195][:K]
             else:
@@ -398,7 +393,6 @@ def smart_logo_variant():
             if int(np.sum(comp)) == 0:
                 continue
 
-            # Skip gradient components for recolor
             if gradient_mode == "skip" and is_gradient_component(comp):
                 continue
 
@@ -415,15 +409,10 @@ def smart_logo_variant():
                 changed_pixels += apply_layered_palette(blackish, to='white')
                 changed_pixels += apply_layered_palette(whiteish, to='black')
 
-            # stroke-variant handled below
-
         # ============================================================
-        # STEP 8: Stroke variant (guarantees different output even for Google)
+        # STEP 8: Stroke variant
         # ============================================================
         def add_logo_stroke(base_mask: np.ndarray, bg_is_dark: bool, thickness: int = 2) -> int:
-            """
-            Outer stroke around logo silhouette (NOT alpha canvas).
-            """
             if int(np.sum(base_mask)) == 0:
                 return 0
 
@@ -436,32 +425,47 @@ def smart_logo_variant():
 
             ring = (dil > 0) & (~base_mask)
 
-            # Contrasting stroke color vs background
             if bg_is_dark:
                 stroke_rgb = np.array([255, 255, 255], dtype=np.uint8)
-                stroke_alpha = 255
             else:
                 stroke_rgb = np.array([0, 0, 0], dtype=np.uint8)
-                stroke_alpha = 255
 
             before = data[ring, 0:3].copy()
             data[ring, 0:3] = stroke_rgb
-            data[ring, 3] = np.maximum(data[ring, 3], stroke_alpha).astype(np.uint8)
+            data[ring, 3] = np.maximum(data[ring, 3], 255).astype(np.uint8)
 
             if before.size:
                 return int(np.sum(np.any(before != stroke_rgb, axis=1)))
             return int(np.sum(ring))
 
-        # If no recolor happened or mode is stroke-variant -> add stroke
+        # ============================================================
+        # STEP 9: NEW GUARANTEE — Negate whole logo if still unchanged
+        # ============================================================
+        def negate_logo(mask: np.ndarray) -> int:
+            m = mask & (a > alpha_min)
+            ys, xs = np.where(m)
+            if ys.size == 0:
+                return 0
+
+            before = data[ys, xs, 0:3].copy()
+            data[ys, xs, 0:3] = 255 - data[ys, xs, 0:3]
+            after = data[ys, xs, 0:3]
+            return int(np.sum(np.any(before != after, axis=1)))
+
+        # If mode says stroke-variant, apply stroke first
         if mode == "stroke-variant":
             changed_pixels += add_logo_stroke(solid_logo_mask, bg_is_dark=bg_is_dark, thickness=2)
-        else:
-            if changed_pixels == 0 or np.array_equal(data, original):
-                mode = "stroke-variant"
-                changed_pixels += add_logo_stroke(solid_logo_mask, bg_is_dark=bg_is_dark, thickness=2)
 
-        # Last-resort: if still identical (extremely rare), bump thickness and retry once
+        # If still unchanged, negate entire logo (guaranteed different)
         if changed_pixels == 0 or np.array_equal(data, original):
+            neg_changed = negate_logo(logo_mask)
+            if neg_changed > 0:
+                changed_pixels += neg_changed
+                mode = "negate-logo"
+
+        # If STILL unchanged (very rare), fallback to stronger stroke
+        if changed_pixels == 0 or np.array_equal(data, original):
+            mode = "stroke-variant"
             changed_pixels += add_logo_stroke(solid_logo_mask, bg_is_dark=bg_is_dark, thickness=3)
 
         # ============================================================
