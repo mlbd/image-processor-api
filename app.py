@@ -393,11 +393,11 @@ def upload_images_to_ftp(images_dict, folder_id):
             ftp.storbinary(f'STOR {filename}', img_buffer)
             
             # Build public URL
+            # FTP_BASE_URL should be the full public base URL including any subdirectories
+            # e.g., https://lukpaluk.xyz/smart-logo-versions/uploads
+            # We only append folder_id and filename (FTP_DIR is for FTP navigation only)
             base_url = FTP_BASE_URL.rstrip('/')
-            if FTP_DIR:
-                urls[filename] = f"{base_url}/{FTP_DIR.strip('/')}/{folder_id}/{filename}"
-            else:
-                urls[filename] = f"{base_url}/{folder_id}/{filename}"
+            urls[filename] = f"{base_url}/{folder_id}/{filename}"
         
         ftp.quit()
         return urls, "success"
