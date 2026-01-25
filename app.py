@@ -509,7 +509,382 @@ def smart_logo_variant():
             "traceback": traceback.format_exc()
         }), 500
 
+@app.route('/gen-logo-variant', methods=['POST'])
+def gen_logo_variant():
+    """
+    GEN LOGO VARIANT (v1)
+    Always returns a *different* usable variant, while protecting gradients.
 
+    Priority rule:
+    1) If dark-ish pixels are > 30% of solid logo area:
+         -> ONLY convert dark-ish => white-ish (layered palette starting from pure white)
+         -> do NOT invert / swap
+
+    Otherwise:
+    2) If no dark-ish but there is white-ish:
+         -> convert white-ish => black-ish (layered)
+    3) If tiny dark-ish + lots of white-ish (e.g., black 'T' in white circle):
+         -> swap: dark-ish => white-ish AND white-ish => black-ish
+    4) If nothing changes:
+         -> INVERT logo colors (RGB negation) to guarantee a different output
+            (background remains untouched)
+
+    Notes:
+    - Gradient components are detected per connected-component and skipped.
+    - "Layer separation" is preserved by quantizing target pixels to 2..4 levels and mapping to a palette.
+    """
+
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+
+        # -----------------------
+        # Params (safe defaults)
+        # -----------------------
+        dark_thr = int(request.form.get('threshold', DEFAULT_THRESHOLD))
+        dark_thr = max(0, min(255, dark_thr))
+
+        white_threshold = int(request.form.get('white_threshold', 35))
+        white_threshold = max(1, min(80, white_threshold))
+        white_cut = 255 - white_threshold
+
+        alpha_min = int(request.form.get('alpha_min', 10))
+        alpha_min = max(0, min(255, alpha_min))
+
+        # Ratios
+        heavy_dark_cut = float(request.form.get('heavy_dark_ratio', 0.30))
+        heavy_dark_cut = max(0.0, min(1.0, heavy_dark_cut))
+
+        small_dark_ratio = float(request.form.get('small_dark_ratio', 0.02))
+        small_dark_ratio = max(0.0, min(1.0, small_dark_ratio))
+
+        high_white_ratio = float(request.form.get('high_white_ratio', 0.40))
+        high_white_ratio = max(0.0, min(1.0, high_white_ratio))
+
+        gradient_mode = request.form.get('gradient_mode', 'skip').lower().strip()
+        if gradient_mode not in ['skip', 'preserve', 'allow']:
+            gradient_mode = 'skip'
+
+        # -----------------------
+        # Load image
+        # -----------------------
+        img = Image.open(file.stream).convert('RGBA')
+        data = np.array(img)
+        h, w = data.shape[:2]
+
+        r = data[:, :, 0].astype(np.uint8)
+        g = data[:, :, 1].astype(np.uint8)
+        b = data[:, :, 2].astype(np.uint8)
+        a = data[:, :, 3].astype(np.uint8)
+
+        original = data.copy()
+
+        # ============================================================
+        # STEP 1: Background detection
+        # ============================================================
+        corners = [data[0, 0], data[0, w - 1], data[h - 1, 0], data[h - 1, w - 1]]
+        corner_rgb = np.array([c[:3] for c in corners], dtype=np.float32)
+        corner_a   = np.array([c[3]  for c in corners], dtype=np.float32)
+
+        avg_corner = np.mean(corner_rgb, axis=0)
+        avg_alpha  = float(np.mean(corner_a))
+        corner_std = float(np.std(corner_rgb))
+        corners_consistent = corner_std < 30
+
+        bg_mask = (a <= alpha_min)
+
+        if avg_alpha > 200 and corners_consistent:
+            mean_corner = float(np.mean(avg_corner))
+            tolerance = 20
+
+            if mean_corner > 240:
+                bg_mask = bg_mask | ((r > 250) & (g > 250) & (b > 250) & (a > 200))
+            elif mean_corner < 15:
+                bg_mask = bg_mask | ((r < 5) & (g < 5) & (b < 5) & (a > 200))
+            else:
+                bg_mask = bg_mask | (
+                    (np.abs(r.astype(np.int16) - int(avg_corner[0])) < tolerance) &
+                    (np.abs(g.astype(np.int16) - int(avg_corner[1])) < tolerance) &
+                    (np.abs(b.astype(np.int16) - int(avg_corner[2])) < tolerance) &
+                    (a > 200)
+                )
+
+            # Flood fill from corners to keep only corner-connected background
+            potential_bg = (bg_mask.astype(np.uint8) * 255)
+            connected_bg = np.zeros_like(potential_bg)
+
+            for sy, sx in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
+                if potential_bg[sy, sx] > 0:
+                    temp = potential_bg.copy()
+                    flood = np.zeros((h + 2, w + 2), np.uint8)
+                    cv2.floodFill(temp, flood, (sx, sy), 128)
+                    connected_bg[temp == 128] = 255
+
+            bg_mask = connected_bg > 0
+
+        logo_mask = (~bg_mask) & (a > alpha_min)
+        if int(np.sum(logo_mask)) == 0:
+            logo_mask = (a > alpha_min)
+            bg_mask = ~logo_mask
+
+        # ============================================================
+        # STEP 2: Connected components on logo pixels
+        # ============================================================
+        mask_u8 = (logo_mask.astype(np.uint8) * 255)
+        num_cc, cc_labels, cc_stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+
+        # Luminance for decisions
+        luminance = (0.299 * r.astype(np.float32) + 0.587 * g.astype(np.float32) + 0.114 * b.astype(np.float32))
+
+        # ============================================================
+        # STEP 3: Gradient detection per component
+        # ============================================================
+        def is_gradient_component(comp_bool: np.ndarray) -> bool:
+            if gradient_mode == 'allow':
+                return False
+            if gradient_mode in ['skip', 'preserve']:
+                pass
+
+            k = np.ones((3, 3), np.uint8)
+            interior = cv2.erode(comp_bool.astype(np.uint8), k, iterations=1).astype(bool)
+            if interior.sum() < 80:
+                interior = comp_bool
+
+            lum_vals = luminance[interior].astype(np.float32)
+            if lum_vals.size < 140:
+                return False
+
+            hist = np.histogram(lum_vals, bins=32)[0].astype(np.float32)
+            p = hist / (hist.sum() + 1e-9)
+            entropy = float(-np.sum(p * np.log(p + 1e-9)))
+            norm_entropy = entropy / float(np.log(len(p)))
+            dom_mass = float(np.sort(p)[-3:].sum())
+            occupancy = int(np.sum(hist > 0))
+
+            ys, xs = np.where(interior)
+            X = np.column_stack([xs.astype(np.float32), ys.astype(np.float32), np.ones(xs.size, np.float32)])
+            yv = lum_vals
+            coef, *_ = np.linalg.lstsq(X, yv, rcond=None)
+            pred = X @ coef
+            ss_res = float(np.sum((yv - pred) ** 2))
+            ss_tot = float(np.sum((yv - float(yv.mean())) ** 2)) + 1e-9
+            r2 = 1.0 - (ss_res / ss_tot)
+
+            lum_std = float(lum_vals.std())
+            lum_rng = float(lum_vals.max() - lum_vals.min())
+
+            entropy_gradient = (norm_entropy > 0.70 and dom_mass < 0.55 and occupancy > 10 and lum_rng > 20)
+            linear_gradient  = (r2 > 0.60 and lum_std > 8 and lum_rng > 20)
+            return bool(entropy_gradient or linear_gradient)
+
+        # ============================================================
+        # STEP 4: Solid-only stats to decide global mode
+        # ============================================================
+        solid_logo_mask = np.zeros((h, w), dtype=bool)
+
+        for lab in range(1, num_cc):
+            area = int(cc_stats[lab, cv2.CC_STAT_AREA])
+            if area < 25:
+                continue
+            comp = (cc_labels == lab) & logo_mask
+            if comp.sum() == 0:
+                continue
+            if gradient_mode in ['skip', 'preserve'] and is_gradient_component(comp):
+                continue
+            solid_logo_mask |= comp
+
+        solid_px = int(np.sum(solid_logo_mask))
+        if solid_px == 0:
+            solid_logo_mask = logo_mask
+            solid_px = int(np.sum(solid_logo_mask))
+
+        blackish_solid = solid_logo_mask & (r < dark_thr) & (g < dark_thr) & (b < dark_thr)
+        whiteish_solid = solid_logo_mask & (r > white_cut) & (g > white_cut) & (b > white_cut)
+
+        dark_px  = int(np.sum(blackish_solid))
+        white_px = int(np.sum(whiteish_solid))
+
+        dark_ratio  = dark_px  / max(1, solid_px)
+        white_ratio = white_px / max(1, solid_px)
+
+        # Priority: heavy dark => simple dark->white only
+        mode = None
+        if dark_ratio >= heavy_dark_cut:
+            mode = "heavy-dark-to-white"
+        else:
+            if (dark_ratio <= small_dark_ratio) and (white_ratio >= high_white_ratio) and (dark_px > 0) and (white_px > 0):
+                mode = "swap-bw"
+            else:
+                if dark_px == 0 and white_px > 0:
+                    mode = "white-to-black"
+                else:
+                    if dark_px > 0:
+                        mode = "dark-to-white"
+                    else:
+                        mode = "invert-logo"
+
+        # ============================================================
+        # STEP 5: Layered palette mapping (prevents borders merging)
+        # ============================================================
+        def apply_layered_palette(target_mask: np.ndarray, to: str):
+            """
+            Quantize luminance in target_mask into 2..4 levels and map to palette.
+            to: 'white' or 'black'
+            """
+            ys, xs = np.where(target_mask)
+            if ys.size == 0:
+                return 0
+
+            lum = luminance[ys, xs].astype(np.float32)
+
+            lum_rng = float(lum.max() - lum.min()) if lum.size else 0.0
+            if lum.size < 600 or lum_rng < 18:
+                K = 2
+            elif lum_rng < 60:
+                K = 3
+            else:
+                K = 4
+
+            if lum.size < K:
+                K = 2
+
+            Z = lum.reshape(-1, 1).astype(np.float32)
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 60, 0.4)
+            _, labels_k, centers = cv2.kmeans(Z, K, None, criteria, 5, cv2.KMEANS_PP_CENTERS)
+
+            order = np.argsort(centers.flatten())
+            lut = np.empty(K, dtype=np.int32)
+            for rank, old in enumerate(order):
+                lut[int(old)] = rank
+            ranks = lut[labels_k.flatten()]
+
+            if to == 'white':
+                palette = [255, 235, 215, 195][:K]
+            else:
+                palette = [0, 40, 80, 120][:K]
+
+            out = np.take(np.array(palette, dtype=np.uint8), ranks)
+
+            data[ys, xs, 0] = out
+            data[ys, xs, 1] = out
+            data[ys, xs, 2] = out
+
+            return int(ys.size)
+
+        # ============================================================
+        # STEP 6: Apply transform per component (skip gradients)
+        # ============================================================
+        changed_pixels = 0
+        gradients_skipped = 0
+
+        for lab in range(1, num_cc):
+            area = int(cc_stats[lab, cv2.CC_STAT_AREA])
+            if area < 25:
+                continue
+
+            comp = (cc_labels == lab) & logo_mask
+            if int(np.sum(comp)) == 0:
+                continue
+
+            comp_is_grad = False
+            if gradient_mode in ['skip', 'preserve'] and is_gradient_component(comp):
+                comp_is_grad = True
+
+            if comp_is_grad:
+                gradients_skipped += 1
+                continue
+
+            blackish = comp & (r < dark_thr) & (g < dark_thr) & (b < dark_thr)
+            whiteish = comp & (r > white_cut) & (g > white_cut) & (b > white_cut)
+
+            if mode == "heavy-dark-to-white":
+                changed_pixels += apply_layered_palette(blackish, to='white')
+
+            elif mode == "dark-to-white":
+                changed_pixels += apply_layered_palette(blackish, to='white')
+
+            elif mode == "white-to-black":
+                changed_pixels += apply_layered_palette(whiteish, to='black')
+
+            elif mode == "swap-bw":
+                changed_pixels += apply_layered_palette(blackish, to='white')
+                changed_pixels += apply_layered_palette(whiteish, to='black')
+
+            else:
+                # invert-logo handled later
+                pass
+
+        # ============================================================
+        # STEP 7: Invert logo fallback (guarantees a different file)
+        # ============================================================
+        # If nothing changed OR mode was invert-logo, invert RGB of logo pixels only
+        # Background remains completely untouched
+        def invert_logo_colors():
+            nonlocal changed_pixels
+
+            # Invert only logo pixels (non-background)
+            logo_pixels = logo_mask & (a > alpha_min)
+            
+            if not np.any(logo_pixels):
+                return
+
+            # Invert RGB channels for logo pixels only
+            data[logo_pixels, 0] = 255 - data[logo_pixels, 0]
+            data[logo_pixels, 1] = 255 - data[logo_pixels, 1]
+            data[logo_pixels, 2] = 255 - data[logo_pixels, 2]
+            # Alpha channel remains unchanged
+
+            changed_pixels += int(np.sum(logo_pixels))
+
+        if mode == "invert-logo":
+            invert_logo_colors()
+        else:
+            # If result equals original (or no pixels changed), enforce inversion
+            if changed_pixels == 0 or np.array_equal(data, original):
+                mode = "invert-logo"
+                invert_logo_colors()
+
+        # ============================================================
+        # OUTPUT
+        # ============================================================
+        result_img = Image.fromarray(data, 'RGBA')
+        output = BytesIO()
+        result_img.save(output, format='PNG', optimize=True)
+        output.seek(0)
+
+        response = send_file(
+            output,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name='gen_logo_variant.png'
+        )
+
+        response.headers['X-Variant-Mode'] = mode
+        response.headers['X-Dark-Ratio'] = f"{dark_ratio:.4f}"
+        response.headers['X-White-Ratio'] = f"{white_ratio:.4f}"
+        response.headers['X-Changed-Pixels'] = str(int(changed_pixels))
+        response.headers['X-Gradients-Skipped'] = str(int(gradients_skipped))
+        response.headers['X-Dark-Threshold'] = str(dark_thr)
+        response.headers['X-White-Threshold'] = str(white_threshold)
+        response.headers['X-Heavy-Dark-Cut'] = str(heavy_dark_cut)
+
+        return response
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
