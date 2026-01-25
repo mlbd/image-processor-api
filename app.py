@@ -512,26 +512,27 @@ def smart_logo_variant():
 @app.route('/gen-logo-variant', methods=['POST'])
 def gen_logo_variant():
     """
-    GEN LOGO VARIANT (v1)
-    Always returns a *different* usable variant, while protecting gradients.
-
-    Priority rule:
+    GEN LOGO VARIANT (v2) - Fully Autonomous
+    
+    Only accepts: image (file)
+    
+    The API automatically analyzes the logo and makes all decisions:
+    - Auto-detects dark/white pixels based on logo characteristics
+    - Auto-determines the best transformation mode
+    - Auto-handles gradients (skips them to preserve quality)
+    
+    Priority rules (auto-decided):
     1) If dark-ish pixels are > 30% of solid logo area:
-         -> ONLY convert dark-ish => white-ish (layered palette starting from pure white)
-         -> do NOT invert / swap
-
-    Otherwise:
+         -> Convert dark-ish => white-ish (layered palette)
     2) If no dark-ish but there is white-ish:
-         -> convert white-ish => black-ish (layered)
+         -> Convert white-ish => black-ish (layered)
     3) If tiny dark-ish + lots of white-ish (e.g., black 'T' in white circle):
-         -> swap: dark-ish => white-ish AND white-ish => black-ish
+         -> Swap: dark-ish => white-ish AND white-ish => black-ish
     4) If nothing changes:
          -> INVERT logo colors (RGB negation) to guarantee a different output
             (background remains untouched)
-
-    Notes:
-    - Gradient components are detected per connected-component and skipped.
-    - "Layer separation" is preserved by quantizing target pixels to 2..4 levels and mapping to a palette.
+    
+    Always returns a visually different variant - guaranteed.
     """
 
     auth_error = verify_api_key()
@@ -547,31 +548,14 @@ def gen_logo_variant():
             return jsonify({"error": "Empty filename"}), 400
 
         # -----------------------
-        # Params (safe defaults)
+        # Auto-configured params (no user input needed)
         # -----------------------
-        dark_thr = int(request.form.get('threshold', DEFAULT_THRESHOLD))
-        dark_thr = max(0, min(255, dark_thr))
-
-        white_threshold = int(request.form.get('white_threshold', 35))
-        white_threshold = max(1, min(80, white_threshold))
-        white_cut = 255 - white_threshold
-
-        alpha_min = int(request.form.get('alpha_min', 10))
-        alpha_min = max(0, min(255, alpha_min))
-
-        # Ratios
-        heavy_dark_cut = float(request.form.get('heavy_dark_ratio', 0.30))
-        heavy_dark_cut = max(0.0, min(1.0, heavy_dark_cut))
-
-        small_dark_ratio = float(request.form.get('small_dark_ratio', 0.02))
-        small_dark_ratio = max(0.0, min(1.0, small_dark_ratio))
-
-        high_white_ratio = float(request.form.get('high_white_ratio', 0.40))
-        high_white_ratio = max(0.0, min(1.0, high_white_ratio))
-
-        gradient_mode = request.form.get('gradient_mode', 'skip').lower().strip()
-        if gradient_mode not in ['skip', 'preserve', 'allow']:
-            gradient_mode = 'skip'
+        dark_thr = 100          # pixels below this RGB are considered "dark"
+        white_cut = 220         # pixels above this RGB are considered "white" (255 - 35)
+        alpha_min = 10          # minimum alpha to consider pixel as visible
+        heavy_dark_cut = 0.30   # 30% dark triggers "heavy dark to white" mode
+        small_dark_ratio = 0.02 # 2% or less dark = "tiny dark"
+        high_white_ratio = 0.40 # 40% or more white = "mostly white"
 
         # -----------------------
         # Load image
@@ -645,14 +629,10 @@ def gen_logo_variant():
         luminance = (0.299 * r.astype(np.float32) + 0.587 * g.astype(np.float32) + 0.114 * b.astype(np.float32))
 
         # ============================================================
-        # STEP 3: Gradient detection per component
+        # STEP 3: Gradient detection per component (auto-skip gradients)
         # ============================================================
         def is_gradient_component(comp_bool: np.ndarray) -> bool:
-            if gradient_mode == 'allow':
-                return False
-            if gradient_mode in ['skip', 'preserve']:
-                pass
-
+            """Auto-detect if a component is a gradient (will be skipped to preserve quality)"""
             k = np.ones((3, 3), np.uint8)
             interior = cv2.erode(comp_bool.astype(np.uint8), k, iterations=1).astype(bool)
             if interior.sum() < 80:
@@ -697,7 +677,8 @@ def gen_logo_variant():
             comp = (cc_labels == lab) & logo_mask
             if comp.sum() == 0:
                 continue
-            if gradient_mode in ['skip', 'preserve'] and is_gradient_component(comp):
+            # Auto-skip gradient components to preserve quality
+            if is_gradient_component(comp):
                 continue
             solid_logo_mask |= comp
 
@@ -780,7 +761,7 @@ def gen_logo_variant():
             return int(ys.size)
 
         # ============================================================
-        # STEP 6: Apply transform per component (skip gradients)
+        # STEP 6: Apply transform per component (auto-skip gradients)
         # ============================================================
         changed_pixels = 0
         gradients_skipped = 0
@@ -794,11 +775,8 @@ def gen_logo_variant():
             if int(np.sum(comp)) == 0:
                 continue
 
-            comp_is_grad = False
-            if gradient_mode in ['skip', 'preserve'] and is_gradient_component(comp):
-                comp_is_grad = True
-
-            if comp_is_grad:
+            # Auto-skip gradient components
+            if is_gradient_component(comp):
                 gradients_skipped += 1
                 continue
 
@@ -872,9 +850,6 @@ def gen_logo_variant():
         response.headers['X-White-Ratio'] = f"{white_ratio:.4f}"
         response.headers['X-Changed-Pixels'] = str(int(changed_pixels))
         response.headers['X-Gradients-Skipped'] = str(int(gradients_skipped))
-        response.headers['X-Dark-Threshold'] = str(dark_thr)
-        response.headers['X-White-Threshold'] = str(white_threshold)
-        response.headers['X-Heavy-Dark-Cut'] = str(heavy_dark_cut)
 
         return response
 
