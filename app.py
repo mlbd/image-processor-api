@@ -160,75 +160,93 @@ def analyze_image_for_bg_removal(img):
 def remove_bg_color_method(img, bg_color=None, tolerance=25):
     """
     Color-based background removal - perfect for logos/graphics
-    Removes only connected background regions from edges
+    
+    KEY PRINCIPLE: Only remove pixels that are:
+    1. Similar to background color AND
+    2. Connected to the image border (via flood fill)
+    
+    This ensures we NEVER remove interior content, even if it's 
+    similar in color to the background (like white text on gray bg)
     """
     img_rgba = img.convert('RGBA')
-    data = np.array(img_rgba).astype(np.float32)
+    data = np.array(img_rgba)
     h, w = data.shape[:2]
+    rgb = data[:, :, :3].astype(np.float32)
     
     # Detect background color if not provided
     if bg_color is None:
-        corner_size = max(3, min(15, h // 20, w // 20))
+        corner_size = max(5, min(20, h // 15, w // 15))
         corners = [
-            data[0:corner_size, 0:corner_size, :3],
-            data[0:corner_size, w-corner_size:w, :3],
-            data[h-corner_size:h, 0:corner_size, :3],
-            data[h-corner_size:h, w-corner_size:w, :3],
+            rgb[0:corner_size, 0:corner_size],
+            rgb[0:corner_size, w-corner_size:w],
+            rgb[h-corner_size:h, 0:corner_size],
+            rgb[h-corner_size:h, w-corner_size:w],
         ]
         all_corner_pixels = np.vstack([c.reshape(-1, 3) for c in corners])
         bg_color = np.median(all_corner_pixels, axis=0)
     
     bg_color = np.array(bg_color, dtype=np.float32)
     
-    # Calculate color distance from background
-    rgb = data[:, :, :3]
+    # Calculate color distance from background for each pixel
     color_diff = np.sqrt(np.sum((rgb - bg_color) ** 2, axis=2))
     
-    # Hard mask for flood fill (strict tolerance)
-    strict_tolerance = tolerance * 0.8
-    hard_bg_mask = (color_diff < strict_tolerance).astype(np.uint8) * 255
+    # Create binary mask: pixels that COULD be background (within tolerance)
+    potential_bg = (color_diff < tolerance).astype(np.uint8) * 255
     
-    # Flood fill from all border pixels to get connected background
-    connected_bg = np.zeros((h, w), dtype=np.uint8)
+    # Use flood fill from corners and edge midpoints
+    work = potential_bg.copy()
     
-    # Create list of border seed points
-    border_points = []
-    # Top and bottom rows
-    for x in range(0, w, 2):
-        border_points.extend([(x, 0), (x, h-1)])
-    # Left and right columns
-    for y in range(0, h, 2):
-        border_points.extend([(0, y), (w-1, y)])
+    # Flood fill from corners
+    for seed in [(0, 0), (w-1, 0), (0, h-1), (w-1, h-1)]:
+        if work[seed[1], seed[0]] > 0:
+            mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            cv2.floodFill(work, mask, seed, 128)
     
-    for sx, sy in border_points:
-        if 0 <= sx < w and 0 <= sy < h and hard_bg_mask[sy, sx] > 0 and connected_bg[sy, sx] == 0:
-            temp = hard_bg_mask.copy()
-            flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-            cv2.floodFill(temp, flood_mask, (sx, sy), 128)
-            connected_bg[temp == 128] = 255
+    # Flood fill from edge midpoints
+    for seed in [(w//2, 0), (w//2, h-1), (0, h//2), (w-1, h//2)]:
+        if work[seed[1], seed[0]] > 0:
+            mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            cv2.floodFill(work, mask, seed, 128)
     
-    # Create soft alpha for anti-aliased edges
-    # Expand the connected region slightly
+    # Additional flood fills along edges for complete coverage
+    step = max(1, min(w, h) // 20)
+    for x in range(0, w, step):
+        for y_seed in [0, h-1]:
+            if work[y_seed, x] > 0:
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(work, mask, (x, y_seed), 128)
+    for y in range(0, h, step):
+        for x_seed in [0, w-1]:
+            if work[y, x_seed] > 0:
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(work, mask, (x_seed, y), 128)
+    
+    # Connected background is where we flood filled to value 128
+    connected_bg = (work == 128).astype(np.uint8) * 255
+    
+    # Create alpha channel - start fully opaque
+    alpha = np.ones((h, w), dtype=np.float32) * 255
+    
+    # Only the connected background becomes transparent
+    alpha[connected_bg > 0] = 0
+    
+    # Anti-alias the edges for smooth transitions
     kernel = np.ones((3, 3), np.uint8)
-    expanded_bg = cv2.dilate(connected_bg, kernel, iterations=1)
+    dilated = cv2.dilate(connected_bg, kernel, iterations=1)
+    edge_mask = (dilated > 0) & (connected_bg == 0)
     
-    # Soft alpha based on color distance in the expanded region
-    soft_alpha = np.ones((h, w), dtype=np.float32) * 255
+    # For edge pixels, create soft alpha based on color distance
+    edge_alpha = np.clip(color_diff / tolerance * 255, 0, 255)
+    alpha[edge_mask] = np.minimum(alpha[edge_mask], edge_alpha[edge_mask])
     
-    # In connected background: fully transparent
-    soft_alpha[connected_bg > 0] = 0
+    # Slight Gaussian blur for smoother edges
+    alpha = cv2.GaussianBlur(alpha.astype(np.float32), (3, 3), 0)
     
-    # In expanded edge region: gradient based on color distance
-    edge_region = (expanded_bg > 0) & (connected_bg == 0)
-    edge_alpha = np.clip((color_diff[edge_region] - strict_tolerance) / (tolerance * 0.5) * 255, 0, 255)
-    soft_alpha[edge_region] = edge_alpha
+    # Apply alpha to image
+    result = data.copy()
+    result[:, :, 3] = alpha.astype(np.uint8)
     
-    # Slight blur for smoother edges
-    soft_alpha = cv2.GaussianBlur(soft_alpha, (3, 3), 0)
-    
-    data[:, :, 3] = soft_alpha
-    
-    return Image.fromarray(data.astype(np.uint8), 'RGBA')
+    return Image.fromarray(result, 'RGBA')
 
 
 def remove_bg_ai_method(img_bytes, model='isnet-general-use'):
@@ -284,38 +302,65 @@ def remove_bg_smart(img_bytes):
     method_used = None
     result_img = None
     
-    # Decision logic
+    # Decision logic - prefer color-based for solid backgrounds
     use_color_method = (
         analysis['has_solid_bg'] and 
-        analysis['bg_coverage'] > 0.15  # At least 15% is background
+        analysis['bg_coverage'] > 0.10  # At least 10% is background
     ) or (
         analysis['is_graphic'] and 
-        analysis['color_complexity'] < 0.03
+        analysis['color_complexity'] < 0.05
     )
     
     if use_color_method:
-        # Try color-based removal first (better for logos)
+        # Determine tolerance based on background color
+        # For light backgrounds (like gray/white), use LOWER tolerance
+        # to avoid removing light-colored content
+        bg_color = analysis.get('bg_color')
+        if bg_color is not None:
+            bg_brightness = np.mean(bg_color)
+            if bg_brightness > 200:  # Very light background
+                base_tolerance = 15
+            elif bg_brightness > 150:  # Light background  
+                base_tolerance = 18
+            elif bg_brightness < 50:  # Very dark background
+                base_tolerance = 15
+            else:  # Medium brightness
+                base_tolerance = 22
+        else:
+            base_tolerance = 20
+        
+        # Try color-based removal with calculated tolerance
         result_img = remove_bg_color_method(
             img, 
             bg_color=analysis['bg_color'],
-            tolerance=28  # Slightly higher for better coverage
+            tolerance=base_tolerance
         )
-        method_used = "color-based"
+        method_used = f"color-based (tol={base_tolerance})"
         
         # Validate: check if we preserved reasonable content
         content_pixels = count_content_pixels(result_img)
         content_ratio = content_pixels / original_pixels
         
-        # If too little content (< 5%) or too much (> 95%), might be wrong
-        if content_ratio < 0.03 or content_ratio > 0.97:
-            # Try with different tolerance
-            for tol in [20, 35, 45]:
+        # If too little content (< 3%) or too much (> 98%), adjust tolerance
+        if content_ratio < 0.03:
+            # Too aggressive - try lower tolerance
+            for tol in [12, 10, 8]:
                 alt_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=tol)
                 alt_content = count_content_pixels(alt_result)
                 alt_ratio = alt_content / original_pixels
-                if 0.03 < alt_ratio < 0.97:
+                if alt_ratio > 0.03:
                     result_img = alt_result
-                    method_used = f"color-based (tol={tol})"
+                    method_used = f"color-based (tol={tol}, adjusted)"
+                    break
+        elif content_ratio > 0.98:
+            # Not aggressive enough - try higher tolerance
+            for tol in [25, 30, 35]:
+                alt_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=tol)
+                alt_content = count_content_pixels(alt_result)
+                alt_ratio = alt_content / original_pixels
+                if alt_ratio < 0.98:
+                    result_img = alt_result
+                    method_used = f"color-based (tol={tol}, adjusted)"
                     break
     
     else:
@@ -332,21 +377,21 @@ def remove_bg_smart(img_bytes):
             
             # If AI removed too much (common with logos), fall back to color method
             if content_ratio < 0.10 and analysis['has_solid_bg']:
-                color_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=28)
+                color_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=20)
                 color_content = count_content_pixels(color_result)
                 
                 # Use color method if it preserved more content
-                if color_content > content_pixels * 1.5:
+                if color_content > content_pixels * 1.3:
                     result_img = color_result
                     method_used = "color-based (AI fallback)"
         else:
             # AI not available, use color method
-            result_img = remove_bg_color_method(img, tolerance=25)
+            result_img = remove_bg_color_method(img, tolerance=20)
             method_used = "color-based (AI unavailable)"
     
     # Final fallback
     if result_img is None:
-        result_img = remove_bg_color_method(img, tolerance=25)
+        result_img = remove_bg_color_method(img, tolerance=20)
         method_used = "color-based (fallback)"
     
     return result_img, method_used, analysis
