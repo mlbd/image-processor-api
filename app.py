@@ -51,8 +51,8 @@ def home():
         "authentication": "required" if API_KEY else "not required",
         "endpoints": {
             "/health": "GET - Health check",
-            "/remove-bg": "POST - 🎯 Professional background removal (remove.bg quality)",
-            "/remove-bg/models": "GET - List available AI models for background removal",
+            "/remove-bg": "POST - 🎯 Automatic background removal (remove.bg quality)",
+            "/remove-bg/info": "GET - Info about background removal endpoint",
             "/process-logo": "POST - 🚀 FULL PIPELINE: enhance → remove bg → trim → generate all variants",
             "/gen-logo-variant": "POST - 🎯 Generate color variant (with enhance, bg removal, trim)",
             "/logo-type": "POST - 🔍 Detect logo type (returns 'black' or 'white')",
@@ -77,49 +77,279 @@ def health():
 # REMOVE-BG: Professional Background Removal (remove.bg quality)
 # ============================================================
 
-def remove_bg_professional(img_bytes, model='isnet-general-use', alpha_matting=True, 
-                           alpha_matting_foreground_threshold=240,
-                           alpha_matting_background_threshold=10,
-                           alpha_matting_erode_size=10,
-                           post_process=True):
+def analyze_image_for_bg_removal(img):
     """
-    Professional-grade background removal similar to remove.bg
+    Analyze image characteristics to determine best removal strategy
+    Returns dict with analysis results
+    """
+    img_rgb = img.convert('RGB')
+    data = np.array(img_rgb)
+    h, w = data.shape[:2]
     
-    Uses rembg with advanced models and alpha matting for hair/fine edges.
+    analysis = {
+        'has_solid_bg': False,
+        'bg_color': None,
+        'bg_coverage': 0,
+        'is_graphic': False,
+        'color_complexity': 0,
+        'edge_sharpness': 0
+    }
     
-    Models available (best to fastest):
-    - 'isnet-general-use': Best overall quality (recommended, similar to remove.bg)
-    - 'u2net': Good quality, slightly slower
-    - 'u2net_human_seg': Optimized for humans/portraits
-    - 'silueta': Fast, good for simple subjects
-    - 'birefnet-general': New model, excellent quality
+    # 1. Analyze corners for solid background
+    corner_size = max(5, min(30, h // 15, w // 15))
     
-    Alpha matting: Enables fine edge detection for hair, fur, transparent objects
+    corners = [
+        data[0:corner_size, 0:corner_size],
+        data[0:corner_size, w-corner_size:w],
+        data[h-corner_size:h, 0:corner_size],
+        data[h-corner_size:h, w-corner_size:w],
+    ]
+    
+    # Also sample edge midpoints
+    edge_samples = [
+        data[0:corner_size, w//2-corner_size//2:w//2+corner_size//2],  # top
+        data[h-corner_size:h, w//2-corner_size//2:w//2+corner_size//2],  # bottom
+        data[h//2-corner_size//2:h//2+corner_size//2, 0:corner_size],  # left
+        data[h//2-corner_size//2:h//2+corner_size//2, w-corner_size:w],  # right
+    ]
+    
+    all_border_samples = corners + edge_samples
+    
+    # Calculate color stats for each sample
+    sample_means = []
+    sample_stds = []
+    for sample in all_border_samples:
+        pixels = sample.reshape(-1, 3)
+        sample_means.append(np.mean(pixels, axis=0))
+        sample_stds.append(np.std(pixels))
+    
+    # Check if borders have consistent color (solid background indicator)
+    mean_of_means = np.mean(sample_means, axis=0)
+    std_between_samples = np.std(sample_means, axis=0).mean()
+    avg_internal_std = np.mean(sample_stds)
+    
+    # Solid background: low variation within samples AND between samples
+    if avg_internal_std < 20 and std_between_samples < 25:
+        analysis['has_solid_bg'] = True
+        analysis['bg_color'] = mean_of_means.astype(np.uint8)
+        
+        # Calculate how much of image is this background color
+        tolerance = 30
+        bg_mask = np.all(np.abs(data.astype(np.int16) - analysis['bg_color'].astype(np.int16)) < tolerance, axis=2)
+        analysis['bg_coverage'] = np.sum(bg_mask) / (h * w)
+    
+    # 2. Analyze color complexity (logos typically have fewer colors)
+    # Quantize to reduce noise
+    quantized = (data // 32) * 32
+    unique_colors = len(np.unique(quantized.reshape(-1, 3), axis=0))
+    max_possible = (h * w)
+    analysis['color_complexity'] = unique_colors / max_possible
+    
+    # Graphics/logos typically have < 5% color complexity
+    if analysis['color_complexity'] < 0.05:
+        analysis['is_graphic'] = True
+    
+    # 3. Analyze edge sharpness (graphics have sharp edges, photos have gradients)
+    gray = cv2.cvtColor(data, cv2.COLOR_RGB2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    analysis['edge_sharpness'] = np.var(laplacian)
+    
+    return analysis
+
+
+def remove_bg_color_method(img, bg_color=None, tolerance=25):
+    """
+    Color-based background removal - perfect for logos/graphics
+    Removes only connected background regions from edges
+    """
+    img_rgba = img.convert('RGBA')
+    data = np.array(img_rgba).astype(np.float32)
+    h, w = data.shape[:2]
+    
+    # Detect background color if not provided
+    if bg_color is None:
+        corner_size = max(3, min(15, h // 20, w // 20))
+        corners = [
+            data[0:corner_size, 0:corner_size, :3],
+            data[0:corner_size, w-corner_size:w, :3],
+            data[h-corner_size:h, 0:corner_size, :3],
+            data[h-corner_size:h, w-corner_size:w, :3],
+        ]
+        all_corner_pixels = np.vstack([c.reshape(-1, 3) for c in corners])
+        bg_color = np.median(all_corner_pixels, axis=0)
+    
+    bg_color = np.array(bg_color, dtype=np.float32)
+    
+    # Calculate color distance from background
+    rgb = data[:, :, :3]
+    color_diff = np.sqrt(np.sum((rgb - bg_color) ** 2, axis=2))
+    
+    # Hard mask for flood fill (strict tolerance)
+    strict_tolerance = tolerance * 0.8
+    hard_bg_mask = (color_diff < strict_tolerance).astype(np.uint8) * 255
+    
+    # Flood fill from all border pixels to get connected background
+    connected_bg = np.zeros((h, w), dtype=np.uint8)
+    
+    # Create list of border seed points
+    border_points = []
+    # Top and bottom rows
+    for x in range(0, w, 2):
+        border_points.extend([(x, 0), (x, h-1)])
+    # Left and right columns
+    for y in range(0, h, 2):
+        border_points.extend([(0, y), (w-1, y)])
+    
+    for sx, sy in border_points:
+        if 0 <= sx < w and 0 <= sy < h and hard_bg_mask[sy, sx] > 0 and connected_bg[sy, sx] == 0:
+            temp = hard_bg_mask.copy()
+            flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+            cv2.floodFill(temp, flood_mask, (sx, sy), 128)
+            connected_bg[temp == 128] = 255
+    
+    # Create soft alpha for anti-aliased edges
+    # Expand the connected region slightly
+    kernel = np.ones((3, 3), np.uint8)
+    expanded_bg = cv2.dilate(connected_bg, kernel, iterations=1)
+    
+    # Soft alpha based on color distance in the expanded region
+    soft_alpha = np.ones((h, w), dtype=np.float32) * 255
+    
+    # In connected background: fully transparent
+    soft_alpha[connected_bg > 0] = 0
+    
+    # In expanded edge region: gradient based on color distance
+    edge_region = (expanded_bg > 0) & (connected_bg == 0)
+    edge_alpha = np.clip((color_diff[edge_region] - strict_tolerance) / (tolerance * 0.5) * 255, 0, 255)
+    soft_alpha[edge_region] = edge_alpha
+    
+    # Slight blur for smoother edges
+    soft_alpha = cv2.GaussianBlur(soft_alpha, (3, 3), 0)
+    
+    data[:, :, 3] = soft_alpha
+    
+    return Image.fromarray(data.astype(np.uint8), 'RGBA')
+
+
+def remove_bg_ai_method(img_bytes, model='isnet-general-use'):
+    """
+    AI-based background removal using rembg
+    Best for photos with complex backgrounds
     """
     try:
         from rembg import remove, new_session
         
-        # Create session with specified model
-        # isnet-general-use gives results closest to remove.bg
         session = new_session(model)
-        
-        # Remove background with alpha matting for fine edges
         output_bytes = remove(
             img_bytes,
             session=session,
-            alpha_matting=alpha_matting,
-            alpha_matting_foreground_threshold=alpha_matting_foreground_threshold,
-            alpha_matting_background_threshold=alpha_matting_background_threshold,
-            alpha_matting_erode_size=alpha_matting_erode_size,
-            post_process_mask=post_process  # Clean up mask edges
+            alpha_matting=True,
+            alpha_matting_foreground_threshold=240,
+            alpha_matting_background_threshold=10,
+            alpha_matting_erode_size=10,
+            post_process_mask=True
         )
         
-        return output_bytes, True, model
+        return Image.open(BytesIO(output_bytes)).convert('RGBA'), True
         
     except ImportError:
-        return None, False, "rembg not installed. Install with: pip install rembg[gpu] onnxruntime-gpu"
+        return None, False
     except Exception as e:
-        return None, False, str(e)
+        return None, False
+
+
+def count_content_pixels(img_rgba, min_alpha=20):
+    """Count pixels that have meaningful content (not transparent)"""
+    data = np.array(img_rgba)
+    return np.sum(data[:, :, 3] > min_alpha)
+
+
+def remove_bg_smart(img_bytes):
+    """
+    Smart background removal that automatically chooses the best method
+    Similar to how remove.bg works - tries to preserve all content
+    
+    Strategy:
+    1. Analyze image characteristics
+    2. For solid backgrounds: Use color-based (preserves all content)
+    3. For complex backgrounds: Use AI model
+    4. Validate result has reasonable content preserved
+    """
+    img = Image.open(BytesIO(img_bytes))
+    original_pixels = img.width * img.height
+    
+    # Analyze image
+    analysis = analyze_image_for_bg_removal(img)
+    
+    method_used = None
+    result_img = None
+    
+    # Decision logic
+    use_color_method = (
+        analysis['has_solid_bg'] and 
+        analysis['bg_coverage'] > 0.15  # At least 15% is background
+    ) or (
+        analysis['is_graphic'] and 
+        analysis['color_complexity'] < 0.03
+    )
+    
+    if use_color_method:
+        # Try color-based removal first (better for logos)
+        result_img = remove_bg_color_method(
+            img, 
+            bg_color=analysis['bg_color'],
+            tolerance=28  # Slightly higher for better coverage
+        )
+        method_used = "color-based"
+        
+        # Validate: check if we preserved reasonable content
+        content_pixels = count_content_pixels(result_img)
+        content_ratio = content_pixels / original_pixels
+        
+        # If too little content (< 5%) or too much (> 95%), might be wrong
+        if content_ratio < 0.03 or content_ratio > 0.97:
+            # Try with different tolerance
+            for tol in [20, 35, 45]:
+                alt_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=tol)
+                alt_content = count_content_pixels(alt_result)
+                alt_ratio = alt_content / original_pixels
+                if 0.03 < alt_ratio < 0.97:
+                    result_img = alt_result
+                    method_used = f"color-based (tol={tol})"
+                    break
+    
+    else:
+        # Try AI method for photos
+        ai_result, ai_success = remove_bg_ai_method(img_bytes)
+        
+        if ai_success and ai_result:
+            result_img = ai_result
+            method_used = "AI (isnet-general-use)"
+            
+            # Validate AI result
+            content_pixels = count_content_pixels(result_img)
+            content_ratio = content_pixels / original_pixels
+            
+            # If AI removed too much (common with logos), fall back to color method
+            if content_ratio < 0.10 and analysis['has_solid_bg']:
+                color_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=28)
+                color_content = count_content_pixels(color_result)
+                
+                # Use color method if it preserved more content
+                if color_content > content_pixels * 1.5:
+                    result_img = color_result
+                    method_used = "color-based (AI fallback)"
+        else:
+            # AI not available, use color method
+            result_img = remove_bg_color_method(img, tolerance=25)
+            method_used = "color-based (AI unavailable)"
+    
+    # Final fallback
+    if result_img is None:
+        result_img = remove_bg_color_method(img, tolerance=25)
+        method_used = "color-based (fallback)"
+    
+    return result_img, method_used, analysis
 
 
 def refine_edges(img_rgba, edge_smoothing=1, feather_amount=0):
@@ -168,45 +398,18 @@ def refine_edges(img_rgba, edge_smoothing=1, feather_amount=0):
 @app.route('/remove-bg', methods=['POST'])
 def remove_bg_endpoint():
     """
-    Professional Background Removal - remove.bg quality
+    🎯 Professional Background Removal - Automatic, remove.bg quality
     
-    Removes background from images with high precision, including:
-    - Fine hair and fur details
-    - Semi-transparent objects
-    - Complex edges
+    Automatically analyzes the image and chooses the best removal method:
+    - Logos/graphics with solid backgrounds → Color-based removal (keeps all text/elements)
+    - Photos with complex backgrounds → AI model removal
+    
+    Just upload your image - the system handles everything automatically!
     
     Parameters:
     -----------
     image: file (required)
         The image to process (PNG, JPG, WebP supported)
-    
-    model: string (optional, default='isnet-general-use')
-        AI model to use:
-        - 'isnet-general-use': Best quality (recommended, closest to remove.bg)
-        - 'birefnet-general': Excellent quality, newer model
-        - 'u2net': Good quality, reliable
-        - 'u2net_human_seg': Optimized for people/portraits
-        - 'silueta': Faster, good for simple subjects
-    
-    alpha_matting: bool (optional, default=true)
-        Enable alpha matting for fine edge details (hair, fur, etc.)
-        Set to false for faster processing on simple subjects
-    
-    foreground_threshold: int (optional, default=240)
-        Alpha matting foreground threshold (0-255)
-        Higher = more aggressive foreground detection
-    
-    background_threshold: int (optional, default=10)
-        Alpha matting background threshold (0-255)
-        Lower = more aggressive background removal
-    
-    erode_size: int (optional, default=10)
-        Alpha matting erosion size
-        Larger = tighter crop around subject
-    
-    edge_smoothing: int (optional, default=1)
-        Post-processing edge smoothing (0-5)
-        Higher = smoother edges
     
     trim: bool (optional, default=false)
         Auto-crop to remove extra transparent space
@@ -219,8 +422,7 @@ def remove_bg_endpoint():
     PNG/WebP image with transparent background
     
     Headers:
-    - X-Model-Used: Which AI model was used
-    - X-Alpha-Matting: Whether alpha matting was applied
+    - X-Method-Used: Which removal method was used
     - X-Processing-Time: Time taken in seconds
     """
     import time
@@ -241,72 +443,27 @@ def remove_bg_endpoint():
                     "content_type": "multipart/form-data",
                     "required_field": "image",
                     "optional_fields": {
-                        "model": "isnet-general-use | birefnet-general | u2net | u2net_human_seg | silueta",
-                        "alpha_matting": "true | false",
-                        "foreground_threshold": "0-255 (default: 240)",
-                        "background_threshold": "0-255 (default: 10)",
-                        "erode_size": "1-50 (default: 10)",
-                        "edge_smoothing": "0-5 (default: 1)",
-                        "trim": "true | false",
+                        "trim": "true | false (auto-crop transparent space)",
                         "output_format": "png | webp"
-                    }
+                    },
+                    "example": "curl -X POST -F 'image=@photo.jpg' http://your-api/remove-bg -o result.png"
                 }
             }), 400
         
         file = request.files['image']
         
         # Read parameters
-        model = request.form.get('model', 'isnet-general-use')
-        alpha_matting = request.form.get('alpha_matting', 'true').lower() == 'true'
-        fg_threshold = int(request.form.get('foreground_threshold', 240))
-        bg_threshold = int(request.form.get('background_threshold', 10))
-        erode_size = int(request.form.get('erode_size', 10))
-        edge_smoothing = int(request.form.get('edge_smoothing', 1))
         do_trim = request.form.get('trim', 'false').lower() == 'true'
         output_format = request.form.get('output_format', 'png').lower()
-        
-        # Validate model
-        valid_models = ['isnet-general-use', 'birefnet-general', 'u2net', 'u2net_human_seg', 'silueta', 'u2netp']
-        if model not in valid_models:
-            return jsonify({
-                "error": f"Invalid model: {model}",
-                "valid_models": valid_models,
-                "recommendation": "Use 'isnet-general-use' for best quality (similar to remove.bg)"
-            }), 400
-        
-        # Clamp values
-        fg_threshold = max(0, min(255, fg_threshold))
-        bg_threshold = max(0, min(255, bg_threshold))
-        erode_size = max(1, min(50, erode_size))
-        edge_smoothing = max(0, min(5, edge_smoothing))
         
         # Read image bytes
         img_bytes = file.read()
         
-        # Perform background removal
-        result_bytes, success, info = remove_bg_professional(
-            img_bytes,
-            model=model,
-            alpha_matting=alpha_matting,
-            alpha_matting_foreground_threshold=fg_threshold,
-            alpha_matting_background_threshold=bg_threshold,
-            alpha_matting_erode_size=erode_size,
-            post_process=True
-        )
-        
-        if not success:
-            return jsonify({
-                "error": "Background removal failed",
-                "details": info,
-                "suggestion": "Make sure rembg is installed: pip install rembg[gpu]"
-            }), 500
-        
-        # Load result as PIL Image
-        result_img = Image.open(BytesIO(result_bytes)).convert('RGBA')
+        # Smart background removal - automatically chooses best method
+        result_img, method_used, analysis = remove_bg_smart(img_bytes)
         
         # Apply edge refinement
-        if edge_smoothing > 0:
-            result_img = refine_edges(result_img, edge_smoothing=edge_smoothing)
+        result_img = refine_edges(result_img, edge_smoothing=1)
         
         # Trim whitespace if requested
         if do_trim:
@@ -337,8 +494,9 @@ def remove_bg_endpoint():
         )
         
         # Add informative headers
-        response.headers['X-Model-Used'] = model
-        response.headers['X-Alpha-Matting'] = str(alpha_matting)
+        response.headers['X-Method-Used'] = method_used
+        response.headers['X-Has-Solid-BG'] = str(analysis.get('has_solid_bg', False))
+        response.headers['X-Is-Graphic'] = str(analysis.get('is_graphic', False))
         response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
         response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
         
@@ -353,47 +511,30 @@ def remove_bg_endpoint():
         }), 500
 
 
-@app.route('/remove-bg/models', methods=['GET'])
-def list_bg_removal_models():
-    """List available background removal models with descriptions"""
+@app.route('/remove-bg/info', methods=['GET'])
+def remove_bg_info():
+    """Information about the background removal endpoint"""
     return jsonify({
-        "models": {
-            "isnet-general-use": {
-                "quality": "★★★★★",
-                "speed": "Medium",
-                "description": "Best overall quality, closest to remove.bg. Recommended for most use cases.",
-                "best_for": "General images, products, people, animals"
-            },
-            "birefnet-general": {
-                "quality": "★★★★★",
-                "speed": "Medium",
-                "description": "Newer model with excellent edge detection. Great for complex backgrounds.",
-                "best_for": "Complex scenes, detailed edges"
-            },
-            "u2net": {
-                "quality": "★★★★",
-                "speed": "Medium",
-                "description": "Reliable quality, well-tested model.",
-                "best_for": "General purpose, reliable results"
-            },
-            "u2net_human_seg": {
-                "quality": "★★★★",
-                "speed": "Medium",
-                "description": "Optimized specifically for human subjects.",
-                "best_for": "Portraits, people, full body shots"
-            },
-            "silueta": {
-                "quality": "★★★",
-                "speed": "Fast",
-                "description": "Faster processing, good for simple subjects.",
-                "best_for": "Simple backgrounds, quick processing"
-            }
+        "endpoint": "/remove-bg",
+        "description": "Automatic background removal - works like remove.bg",
+        "how_it_works": {
+            "step_1": "Analyzes your image automatically",
+            "step_2": "Detects if it's a logo/graphic or photo",
+            "step_3": "Uses the best method for that image type",
+            "step_4": "Returns image with transparent background"
         },
-        "recommendation": "Use 'isnet-general-use' for remove.bg-like quality",
-        "tips": {
-            "fine_details": "Enable alpha_matting=true for hair, fur, and fine edges",
-            "speed": "Use silueta with alpha_matting=false for fastest results",
-            "portraits": "Use u2net_human_seg for best results on people"
+        "supported_inputs": ["PNG", "JPG", "JPEG", "WebP", "BMP", "GIF"],
+        "output_formats": ["PNG (default)", "WebP"],
+        "usage": {
+            "simple": "curl -X POST -F 'image=@your-image.png' http://your-api/remove-bg -o result.png",
+            "with_trim": "curl -X POST -F 'image=@your-image.png' -F 'trim=true' http://your-api/remove-bg -o result.png",
+            "webp_output": "curl -X POST -F 'image=@your-image.png' -F 'output_format=webp' http://your-api/remove-bg -o result.webp"
+        },
+        "features": {
+            "auto_detection": "Automatically detects logos vs photos",
+            "preserves_content": "Keeps all text and elements in logos",
+            "smooth_edges": "Anti-aliased edges for professional results",
+            "ai_fallback": "Uses AI for complex photo backgrounds"
         }
     })
 
