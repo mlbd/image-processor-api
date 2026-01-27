@@ -8,13 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Optional: keep model cache inside container path
+# Keep rembg model cache in a known path inside the container
 ENV U2NET_HOME=/app/.u2net
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Warm rembg model during build (no ARG lines inside here!)
+# Warm model (ONLY python code inside)
 RUN python - <<'PY'
 from rembg import new_session
 new_session("isnet-general-use")
@@ -24,5 +24,4 @@ PY
 COPY app.py .
 
 EXPOSE 5000
-
 CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "120"]
