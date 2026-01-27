@@ -5,13 +5,6 @@ from io import BytesIO
 import os
 import cv2
 
-# Optional: background removal (install: rembg + onnxruntime)
-try:
-    from rembg import remove, new_session
-except Exception:
-    remove = None
-    new_session = None
-
 app = Flask(__name__)
 
 # Environment variables
@@ -49,8 +42,7 @@ def home():
             "/replace-dark-to-white": "POST - Replace dark colors with white",
             "/replace-light-to-dark": "POST - Replace light colors with dark",
             "/invert-colors": "POST - Invert all colors",
-            "/check-transparency": "POST - Check image transparency",
-            "/remove-bg": "POST - Remove background (transparent PNG)"
+            "/check-transparency": "POST - Check image transparency"
         }
     })
 
@@ -87,18 +79,6 @@ def check_dependencies():
     except Exception as e:
         deps['opencv'] = f'NOT INSTALLED: {str(e)}'
     
-    try:
-        import rembg
-        deps['rembg'] = getattr(rembg, '__version__', 'installed')
-    except Exception as e:
-        deps['rembg'] = f'NOT INSTALLED: {str(e)}'
-
-    try:
-        import onnxruntime
-        deps['onnxruntime'] = getattr(onnxruntime, '__version__', 'installed')
-    except Exception as e:
-        deps['onnxruntime'] = f'NOT INSTALLED: {str(e)}'
-
     return jsonify({
         "dependencies": deps,
         "opencv_available": 'cv2' in dir()
@@ -124,121 +104,6 @@ def admin():
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "coffee_level": f"{random.randint(60, 100)}%"
     })
-
-
-
-# --------------------------------------------------------------------
-# Remove Background (remove.bg-like) - transparent PNG output
-# --------------------------------------------------------------------
-_RMBG_SESSION = None
-_RMBG_MODEL_NAME = os.environ.get('RMBG_MODEL', 'isnet-general-use')
-
-def _get_rmbg_session():
-    """Lazy-load the model once per worker process."""
-    global _RMBG_SESSION
-    if _RMBG_SESSION is not None:
-        return _RMBG_SESSION
-    if new_session is None:
-        return None
-    try:
-        _RMBG_SESSION = new_session(_RMBG_MODEL_NAME)
-    except Exception:
-        # Fallback to rembg default if env model name is unknown
-        _RMBG_SESSION = new_session()
-    return _RMBG_SESSION
-
-@app.route('/remove-bg', methods=['POST'])
-def remove_bg():
-    """
-    Remove background and return a transparent PNG.
-
-    Form-data:
-    - image: file (required)
-
-    Notes:
-    - For best results, install: rembg + onnxruntime (or onnxruntime-gpu on CUDA servers).
-    - Uses a strong general-purpose RMBG model by default (configurable by RMBG_MODEL env).
-    """
-    auth_error = verify_api_key()
-    if auth_error:
-        return auth_error
-
-    if remove is None:
-        return jsonify({
-            "error": "Dependency missing",
-            "message": "Background removal requires 'rembg' and 'onnxruntime'. Install them and redeploy."
-        }), 500
-
-    try:
-        if 'image' not in request.files:
-            return jsonify({"error": "No image file provided"}), 400
-
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({"error": "Empty filename"}), 400
-
-        # Read bytes
-        inp = file.read()
-        if not inp:
-            return jsonify({"error": "Empty file"}), 400
-
-        # Run RMBG
-        # alpha_matting improves edges (hair/soft boundaries) but is slower.
-        # We'll use a balanced default to feel closer to remove.bg.
-        session = _get_rmbg_session()
-        out = remove(
-            inp,
-            session=session,
-            alpha_matting=True,
-            alpha_matting_foreground_threshold=240,
-            alpha_matting_background_threshold=10,
-            alpha_matting_erode_size=10
-        )
-
-        # Ensure output is a valid PNG
-        # (rembg usually returns PNG bytes already)
-        try:
-            img = Image.open(BytesIO(out)).convert('RGBA')
-        except Exception:
-            # If something odd happened, try treating bytes as raw image output
-            img = Image.open(BytesIO(out)).convert('RGBA')
-
-        # Optional: trim fully transparent border a little (keeps UX nice)
-        # Only crop if it doesn't remove all pixels.
-        arr = np.array(img)
-        alpha = arr[:, :, 3]
-        ys, xs = np.where(alpha > 0)
-        if ys.size > 0 and xs.size > 0:
-            y0, y1 = int(ys.min()), int(ys.max())
-            x0, x1 = int(xs.min()), int(xs.max())
-            # Add small padding
-            pad = 8
-            y0 = max(0, y0 - pad); x0 = max(0, x0 - pad)
-            y1 = min(img.height - 1, y1 + pad); x1 = min(img.width - 1, x1 + pad)
-            if (y1 - y0) > 2 and (x1 - x0) > 2:
-                img = img.crop((x0, y0, x1 + 1, y1 + 1))
-
-        output = BytesIO()
-        img.save(output, format='PNG', optimize=True)
-        output.seek(0)
-
-        resp = send_file(
-            output,
-            mimetype='image/png',
-            as_attachment=True,
-            download_name='removed_bg.png'
-        )
-        resp.headers['X-RMBG-Model'] = str(_RMBG_MODEL_NAME)
-        resp.headers['X-RMBG-AlphaMatting'] = 'true'
-        return resp
-
-    except Exception as e:
-        import traceback
-        return jsonify({
-            "error": "Processing failed",
-            "details": str(e),
-            "traceback": traceback.format_exc()
-        }), 500
 
 @app.route('/smart-logo-variant', methods=['POST'])
 def smart_logo_variant():
