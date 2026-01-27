@@ -5,6 +5,11 @@ gunicorn==22.0.0
 Werkzeug==3.0.3
 opencv-python-headless==4.10.0.84
 requests==2.31.0
+
+# Background removal - withoutBG (4-stage pipeline, best quality)
+withoutbg>=1.0.0
+
+# Background removal - rembg (fallback option)
 rembg==2.0.50
 onnxruntime==1.17.0
 pooch>=1.6.0

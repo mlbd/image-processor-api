@@ -165,8 +165,8 @@ def remove_bg_color_method(img, bg_color=None, tolerance=25):
     1. Similar to background color AND
     2. Connected to the image border (via flood fill)
     
-    This ensures we NEVER remove interior content, even if it's 
-    similar in color to the background (like white text on gray bg)
+    Also handles anti-aliased edges by making them semi-transparent
+    based on their similarity to the background color.
     """
     img_rgba = img.convert('RGBA')
     data = np.array(img_rgba)
@@ -227,19 +227,37 @@ def remove_bg_color_method(img, bg_color=None, tolerance=25):
     # Create alpha channel - start fully opaque
     alpha = np.ones((h, w), dtype=np.float32) * 255
     
-    # Only the connected background becomes transparent
+    # Connected background becomes fully transparent
     alpha[connected_bg > 0] = 0
     
-    # Anti-alias the edges for smooth transitions
-    kernel = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(connected_bg, kernel, iterations=1)
-    edge_mask = (dilated > 0) & (connected_bg == 0)
+    # IMPROVED: Handle anti-aliased edges
+    # Find the edge region (pixels adjacent to the removed background)
+    kernel = np.ones((5, 5), np.uint8)  # Larger kernel to catch more edge pixels
+    dilated = cv2.dilate(connected_bg, kernel, iterations=2)
+    edge_region = (dilated > 0) & (connected_bg == 0)
     
-    # For edge pixels, create soft alpha based on color distance
-    edge_alpha = np.clip(color_diff / tolerance * 255, 0, 255)
-    alpha[edge_mask] = np.minimum(alpha[edge_mask], edge_alpha[edge_mask])
+    # For edge pixels, check if they're "gray-ish" (similar R, G, B values)
+    # These are likely anti-aliasing artifacts, not actual content
+    r, g, b = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    is_grayish = (np.abs(r - g) < 15) & (np.abs(g - b) < 15) & (np.abs(r - b) < 15)
     
-    # Slight Gaussian blur for smoother edges
+    # For grayish edge pixels, make them more transparent based on similarity to background
+    grayish_edge = edge_region & is_grayish
+    
+    # Calculate alpha for these pixels - closer to bg color = more transparent
+    # Extended tolerance for edge anti-aliasing
+    extended_tolerance = tolerance * 2.5
+    edge_alpha = np.clip((color_diff - tolerance * 0.3) / extended_tolerance * 255, 0, 255)
+    
+    # Apply to grayish edge pixels
+    alpha[grayish_edge] = np.minimum(alpha[grayish_edge], edge_alpha[grayish_edge])
+    
+    # For non-grayish edge pixels (actual colored content), use gentler transparency
+    colored_edge = edge_region & ~is_grayish
+    colored_edge_alpha = np.clip((color_diff) / tolerance * 255, 0, 255)
+    alpha[colored_edge] = np.minimum(alpha[colored_edge], np.maximum(colored_edge_alpha[colored_edge], 200))
+    
+    # Gaussian blur for smooth edges
     alpha = cv2.GaussianBlur(alpha.astype(np.float32), (3, 3), 0)
     
     # Apply alpha to image
@@ -268,12 +286,57 @@ def remove_bg_ai_method(img_bytes, model='isnet-general-use'):
             post_process_mask=True
         )
         
-        return Image.open(BytesIO(output_bytes)).convert('RGBA'), True
+        return Image.open(BytesIO(output_bytes)).convert('RGBA'), True, "rembg"
         
     except ImportError:
-        return None, False
+        return None, False, "rembg not installed"
     except Exception as e:
-        return None, False
+        return None, False, str(e)
+
+
+# Global variable to cache withoutBG model (loaded once, reused)
+_withoutbg_model = None
+
+def get_withoutbg_model():
+    """
+    Get or initialize the withoutBG model (singleton pattern)
+    Model is loaded once and reused for all requests
+    """
+    global _withoutbg_model
+    if _withoutbg_model is None:
+        try:
+            from withoutbg import WithoutBG
+            _withoutbg_model = WithoutBG.opensource()
+        except ImportError:
+            return None
+    return _withoutbg_model
+
+
+def remove_bg_withoutbg_method(img):
+    """
+    AI-based background removal using withoutBG (4-stage pipeline)
+    Best quality for photos - uses Depth + ISNet + Matting + Refiner
+    
+    FREE and runs locally on your server
+    """
+    try:
+        model = get_withoutbg_model()
+        if model is None:
+            return None, False, "withoutbg not installed"
+        
+        # withoutBG accepts PIL Image directly
+        result = model.remove_background(img)
+        
+        # Ensure RGBA mode
+        if result.mode != 'RGBA':
+            result = result.convert('RGBA')
+        
+        return result, True, "withoutbg (4-stage pipeline)"
+        
+    except ImportError:
+        return None, False, "withoutbg not installed. Install with: pip install withoutbg"
+    except Exception as e:
+        return None, False, str(e)
 
 
 def count_content_pixels(img_rgba, min_alpha=20):
@@ -289,8 +352,8 @@ def remove_bg_smart(img_bytes):
     
     Strategy:
     1. Analyze image characteristics
-    2. For solid backgrounds: Use color-based (preserves all content)
-    3. For complex backgrounds: Use AI model
+    2. For solid backgrounds (logos/graphics): Use color-based (preserves all content)
+    3. For complex backgrounds (photos): Use withoutBG 4-stage pipeline
     4. Validate result has reasonable content preserved
     """
     img = Image.open(BytesIO(img_bytes))
@@ -302,7 +365,7 @@ def remove_bg_smart(img_bytes):
     method_used = None
     result_img = None
     
-    # Decision logic - prefer color-based for solid backgrounds
+    # Decision logic - prefer color-based for solid backgrounds (logos)
     use_color_method = (
         analysis['has_solid_bg'] and 
         analysis['bg_coverage'] > 0.10  # At least 10% is background
@@ -364,30 +427,49 @@ def remove_bg_smart(img_bytes):
                     break
     
     else:
-        # Try AI method for photos
-        ai_result, ai_success = remove_bg_ai_method(img_bytes)
+        # For photos - try withoutBG first (best quality), fallback to rembg
+        withoutbg_result, withoutbg_success, withoutbg_info = remove_bg_withoutbg_method(img)
         
-        if ai_success and ai_result:
-            result_img = ai_result
-            method_used = "AI (isnet-general-use)"
+        if withoutbg_success and withoutbg_result:
+            result_img = withoutbg_result
+            method_used = withoutbg_info
             
-            # Validate AI result
+            # Validate result
             content_pixels = count_content_pixels(result_img)
             content_ratio = content_pixels / original_pixels
             
-            # If AI removed too much (common with logos), fall back to color method
+            # If withoutBG removed too much and image has solid bg, try color method
             if content_ratio < 0.10 and analysis['has_solid_bg']:
                 color_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=20)
                 color_content = count_content_pixels(color_result)
                 
-                # Use color method if it preserved more content
                 if color_content > content_pixels * 1.3:
                     result_img = color_result
-                    method_used = "color-based (AI fallback)"
+                    method_used = "color-based (withoutbg fallback)"
         else:
-            # AI not available, use color method
-            result_img = remove_bg_color_method(img, tolerance=20)
-            method_used = "color-based (AI unavailable)"
+            # withoutBG not available, try rembg
+            ai_result, ai_success, ai_info = remove_bg_ai_method(img_bytes)
+            
+            if ai_success and ai_result:
+                result_img = ai_result
+                method_used = f"rembg ({ai_info})"
+                
+                # Validate AI result
+                content_pixels = count_content_pixels(result_img)
+                content_ratio = content_pixels / original_pixels
+                
+                # If AI removed too much, fall back to color method
+                if content_ratio < 0.10 and analysis['has_solid_bg']:
+                    color_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=20)
+                    color_content = count_content_pixels(color_result)
+                    
+                    if color_content > content_pixels * 1.3:
+                        result_img = color_result
+                        method_used = "color-based (AI fallback)"
+            else:
+                # No AI available, use color method
+                result_img = remove_bg_color_method(img, tolerance=20)
+                method_used = "color-based (AI unavailable)"
     
     # Final fallback
     if result_img is None:
@@ -559,27 +641,53 @@ def remove_bg_endpoint():
 @app.route('/remove-bg/info', methods=['GET'])
 def remove_bg_info():
     """Information about the background removal endpoint"""
+    
+    # Check which AI backends are available
+    withoutbg_available = False
+    rembg_available = False
+    
+    try:
+        from withoutbg import WithoutBG
+        withoutbg_available = True
+    except ImportError:
+        pass
+    
+    try:
+        from rembg import remove
+        rembg_available = True
+    except ImportError:
+        pass
+    
     return jsonify({
         "endpoint": "/remove-bg",
         "description": "Automatic background removal - works like remove.bg",
-        "how_it_works": {
-            "step_1": "Analyzes your image automatically",
-            "step_2": "Detects if it's a logo/graphic or photo",
-            "step_3": "Uses the best method for that image type",
-            "step_4": "Returns image with transparent background"
+        "ai_backends": {
+            "withoutbg": {
+                "available": withoutbg_available,
+                "description": "4-stage pipeline (Depth → ISNet → Matting → Refiner)",
+                "quality": "★★★★★ Best for photos",
+                "model_size": "~320MB (downloaded on first use)"
+            },
+            "rembg": {
+                "available": rembg_available,
+                "description": "ISNet segmentation with alpha matting",
+                "quality": "★★★★ Good for photos",
+                "model_size": "~170MB"
+            },
+            "color_based": {
+                "available": True,
+                "description": "Flood-fill color removal for solid backgrounds",
+                "quality": "★★★★★ Best for logos/graphics",
+                "model_size": "None (no AI needed)"
+            }
         },
-        "supported_inputs": ["PNG", "JPG", "JPEG", "WebP", "BMP", "GIF"],
-        "output_formats": ["PNG (default)", "WebP"],
+        "auto_detection": {
+            "logos_graphics": "Uses color-based removal (keeps all text/elements)",
+            "photos": "Uses withoutBG or rembg (handles complex backgrounds)"
+        },
         "usage": {
             "simple": "curl -X POST -F 'image=@your-image.png' http://your-api/remove-bg -o result.png",
-            "with_trim": "curl -X POST -F 'image=@your-image.png' -F 'trim=true' http://your-api/remove-bg -o result.png",
-            "webp_output": "curl -X POST -F 'image=@your-image.png' -F 'output_format=webp' http://your-api/remove-bg -o result.webp"
-        },
-        "features": {
-            "auto_detection": "Automatically detects logos vs photos",
-            "preserves_content": "Keeps all text and elements in logos",
-            "smooth_edges": "Anti-aliased edges for professional results",
-            "ai_fallback": "Uses AI for complex photo backgrounds"
+            "with_trim": "curl -X POST -F 'image=@your-image.png' -F 'trim=true' http://your-api/remove-bg -o result.png"
         }
     })
 

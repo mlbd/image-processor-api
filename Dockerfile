@@ -10,17 +10,21 @@ WORKDIR /app
 
 # Set environment variables for model caching
 ENV U2NET_HOME=/app/.u2net
+ENV HF_HOME=/app/.cache/huggingface
 ENV HOME=/app
 
-# Create cache directory for rembg models
-RUN mkdir -p /app/.u2net
+# Create cache directories
+RUN mkdir -p /app/.u2net /app/.cache/huggingface
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the isnet-general-use model (recommended for remove.bg quality)
-# This prevents download on first request and speeds up cold starts
-RUN python -c "from rembg import new_session; new_session('isnet-general-use')"
+# Pre-download withoutBG models (4-stage pipeline ~320MB)
+# This prevents download on first request
+RUN python -c "from withoutbg import WithoutBG; WithoutBG.opensource()" || echo "withoutbg models will download on first use"
+
+# Pre-download rembg model as fallback
+RUN python -c "from rembg import new_session; new_session('isnet-general-use')" || echo "rembg model will download on first use"
 
 COPY app.py .
 
