@@ -53,6 +53,8 @@ def home():
             "/health": "GET - Health check",
             "/remove-bg": "POST - 🎯 Automatic background removal (remove.bg quality)",
             "/remove-bg/info": "GET - Info about background removal endpoint",
+            "/remove-bg/status": "GET - 🔍 Check AI backend status (withoutbg, rembg)",
+            "/remove-bg/test-withoutbg": "POST - 🧪 Force test withoutBG processing",
             "/process-logo": "POST - 🚀 FULL PIPELINE: enhance → remove bg → trim → generate all variants",
             "/gen-logo-variant": "POST - 🎯 Generate color variant (with enhance, bg removal, trim)",
             "/logo-type": "POST - 🔍 Detect logo type (returns 'black' or 'white')",
@@ -529,7 +531,7 @@ def remove_bg_endpoint():
     
     Automatically analyzes the image and chooses the best removal method:
     - Logos/graphics with solid backgrounds → Color-based removal (keeps all text/elements)
-    - Photos with complex backgrounds → AI model removal
+    - Photos with complex backgrounds → withoutBG 4-stage AI pipeline
     
     Just upload your image - the system handles everything automatically!
     
@@ -620,10 +622,12 @@ def remove_bg_endpoint():
             download_name=f'removed_bg.{extension}'
         )
         
-        # Add informative headers
+        # Add detailed informative headers
         response.headers['X-Method-Used'] = method_used
+        response.headers['X-Image-Type'] = 'logo/graphic' if analysis.get('has_solid_bg') else 'photo'
         response.headers['X-Has-Solid-BG'] = str(analysis.get('has_solid_bg', False))
         response.headers['X-Is-Graphic'] = str(analysis.get('is_graphic', False))
+        response.headers['X-BG-Coverage'] = f"{analysis.get('bg_coverage', 0)*100:.1f}%"
         response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
         response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
         
@@ -690,6 +694,162 @@ def remove_bg_info():
             "with_trim": "curl -X POST -F 'image=@your-image.png' -F 'trim=true' http://your-api/remove-bg -o result.png"
         }
     })
+
+
+@app.route('/remove-bg/status', methods=['GET'])
+def remove_bg_status():
+    """
+    🔍 Diagnostic endpoint to check AI backend status
+    
+    Use this to verify which background removal methods are available and working.
+    """
+    import sys
+    
+    status = {
+        "python_version": sys.version,
+        "backends": {}
+    }
+    
+    # Check withoutBG
+    withoutbg_status = {
+        "installed": False,
+        "version": None,
+        "model_loaded": False,
+        "error": None
+    }
+    try:
+        import withoutbg as wbg
+        withoutbg_status["installed"] = True
+        withoutbg_status["version"] = getattr(wbg, '__version__', 'unknown')
+        
+        # Check if model is loaded
+        global _withoutbg_model
+        if _withoutbg_model is not None:
+            withoutbg_status["model_loaded"] = True
+            withoutbg_status["model_status"] = "Loaded and ready"
+        else:
+            withoutbg_status["model_status"] = "Not loaded yet (will load on first photo request)"
+    except ImportError as e:
+        withoutbg_status["error"] = f"Not installed: {str(e)}"
+    except Exception as e:
+        withoutbg_status["error"] = str(e)
+    
+    status["backends"]["withoutbg"] = withoutbg_status
+    
+    # Check rembg
+    rembg_status = {
+        "installed": False,
+        "version": None,
+        "error": None
+    }
+    try:
+        import rembg
+        rembg_status["installed"] = True
+        rembg_status["version"] = getattr(rembg, '__version__', 'unknown')
+    except ImportError as e:
+        rembg_status["error"] = f"Not installed: {str(e)}"
+    except Exception as e:
+        rembg_status["error"] = str(e)
+    
+    status["backends"]["rembg"] = rembg_status
+    
+    # Check OpenCV
+    cv2_status = {"installed": False, "version": None}
+    try:
+        import cv2
+        cv2_status["installed"] = True
+        cv2_status["version"] = cv2.__version__
+    except ImportError:
+        cv2_status["installed"] = False
+    
+    status["backends"]["opencv"] = cv2_status
+    
+    # Check numpy
+    numpy_status = {"installed": False, "version": None}
+    try:
+        import numpy as np
+        numpy_status["installed"] = True
+        numpy_status["version"] = np.__version__
+    except ImportError:
+        numpy_status["installed"] = False
+    
+    status["backends"]["numpy"] = numpy_status
+    
+    # Summary
+    status["summary"] = {
+        "photo_processing": "withoutbg" if withoutbg_status["installed"] else ("rembg" if rembg_status["installed"] else "color-based only"),
+        "logo_processing": "color-based (always available)",
+        "ready": True
+    }
+    
+    return jsonify(status)
+
+
+@app.route('/remove-bg/test-withoutbg', methods=['POST'])
+def test_withoutbg():
+    """
+    🧪 Test endpoint to force withoutBG processing
+    
+    This endpoint forces the use of withoutBG regardless of image type.
+    Use this to verify withoutBG is working correctly.
+    
+    Returns detailed info about the processing.
+    """
+    import time
+    
+    if 'image' not in request.files:
+        return jsonify({"error": "No image provided"}), 400
+    
+    file = request.files['image']
+    img_bytes = file.read()
+    
+    result = {
+        "withoutbg_test": {},
+        "processing_time": None
+    }
+    
+    # Test withoutBG
+    start = time.time()
+    try:
+        img = Image.open(BytesIO(img_bytes))
+        withoutbg_result, success, info = remove_bg_withoutbg_method(img)
+        
+        result["withoutbg_test"] = {
+            "success": success,
+            "info": info,
+            "output_size": f"{withoutbg_result.width}x{withoutbg_result.height}" if success else None,
+            "output_mode": withoutbg_result.mode if success else None
+        }
+        
+        if success:
+            # Return the processed image
+            output = BytesIO()
+            withoutbg_result.save(output, format='PNG')
+            output.seek(0)
+            
+            processing_time = time.time() - start
+            
+            response = send_file(
+                output,
+                mimetype='image/png',
+                as_attachment=True,
+                download_name='withoutbg_test_result.png'
+            )
+            response.headers['X-Method-Used'] = info
+            response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
+            response.headers['X-Test-Mode'] = 'withoutbg-forced'
+            return response
+        else:
+            result["error"] = info
+            
+    except Exception as e:
+        import traceback
+        result["withoutbg_test"]["error"] = str(e)
+        result["withoutbg_test"]["traceback"] = traceback.format_exc()
+    
+    result["processing_time"] = f"{time.time() - start:.2f}s"
+    
+    return jsonify(result), 500 if "error" in result else 200
 
 
 # ============================================================
