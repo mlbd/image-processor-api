@@ -75,6 +75,56 @@ def health():
     return jsonify({"status": "healthy", "message": "Service is running"})
 
 
+def has_transparency(img):
+    """
+    FAST check if image already has meaningful transparency.
+    Returns True if image has transparent pixels (alpha < 255).
+    
+    This is the FIRST check - if True, we skip all processing and return immediately.
+    """
+    if img.mode != 'RGBA':
+        return False
+    
+    # Get alpha channel
+    alpha = np.array(img.split()[3])
+    
+    # Check if there are any transparent pixels
+    transparent_pixels = np.sum(alpha < 255)
+    total_pixels = alpha.size
+    
+    # If more than 1% of pixels are transparent, consider it already processed
+    transparency_ratio = transparent_pixels / total_pixels
+    
+    return transparency_ratio > 0.01
+
+
+def has_solid_background(img, threshold=0.85):
+    """
+    Quick check if image has a solid color background.
+    Used to decide method, but not critical - withoutBG handles both well.
+    """
+    rgb = np.array(img.convert('RGB'))
+    h, w = rgb.shape[:2]
+    
+    # Sample corners
+    corner_size = max(5, min(20, h // 20, w // 20))
+    corners = [
+        rgb[0:corner_size, 0:corner_size],
+        rgb[0:corner_size, w-corner_size:w],
+        rgb[h-corner_size:h, 0:corner_size],
+        rgb[h-corner_size:h, w-corner_size:w],
+    ]
+    
+    all_corners = np.vstack([c.reshape(-1, 3) for c in corners])
+    bg_color = np.median(all_corners, axis=0)
+    
+    # Check how uniform the corners are
+    color_diff = np.sqrt(np.sum((all_corners - bg_color) ** 2, axis=1))
+    uniform_ratio = np.sum(color_diff < 20) / len(color_diff)
+    
+    return uniform_ratio > threshold, bg_color
+
+
 # ============================================================
 # REMOVE-BG: Professional Background Removal (remove.bg quality)
 # ============================================================
@@ -300,10 +350,7 @@ def remove_bg_ai_method(img_bytes, model='isnet-general-use'):
 _withoutbg_model = None
 
 def get_withoutbg_model():
-    """
-    Get or initialize the withoutBG model (singleton pattern)
-    Model is loaded once and reused for all requests
-    """
+    """Get or initialize withoutBG model (loaded once, reused forever)"""
     global _withoutbg_model
     if _withoutbg_model is None:
         try:
@@ -311,325 +358,230 @@ def get_withoutbg_model():
             _withoutbg_model = WithoutBG.opensource()
         except ImportError:
             return None
+        except Exception as e:
+            print(f"Error loading withoutBG: {e}")
+            return None
     return _withoutbg_model
 
 
-def remove_bg_withoutbg_method(img):
+def remove_bg_withoutbg(img):
     """
-    AI-based background removal using withoutBG (4-stage pipeline)
-    Best quality for photos - uses Depth + ISNet + Matting + Refiner
+    Remove background using withoutBG's 4-stage pipeline:
+    Depth → ISNet → Matting → Refiner
     
-    FREE and runs locally on your server
+    Works well for BOTH photos AND logos/graphics.
     """
     try:
         model = get_withoutbg_model()
         if model is None:
-            return None, False, "withoutbg not installed"
+            return None, "withoutbg not available"
         
-        # withoutBG accepts PIL Image directly
         result = model.remove_background(img)
         
-        # Ensure RGBA mode
         if result.mode != 'RGBA':
             result = result.convert('RGBA')
         
-        return result, True, "withoutbg (4-stage pipeline)"
+        return result, "withoutbg"
         
-    except ImportError:
-        return None, False, "withoutbg not installed. Install with: pip install withoutbg"
     except Exception as e:
-        return None, False, str(e)
+        return None, f"withoutbg error: {str(e)}"
 
 
-def count_content_pixels(img_rgba, min_alpha=20):
-    """Count pixels that have meaningful content (not transparent)"""
-    data = np.array(img_rgba)
-    return np.sum(data[:, :, 3] > min_alpha)
-
-
-def remove_bg_smart(img_bytes):
+def remove_bg_color_based(img, bg_color=None, tolerance=20):
     """
-    Smart background removal that automatically chooses the best method
-    Similar to how remove.bg works - tries to preserve all content
+    Simple color-based background removal.
+    Fallback method if withoutBG is not available.
+    
+    Only removes pixels connected to the border (flood fill).
+    """
+    img_rgba = img.convert('RGBA')
+    data = np.array(img_rgba)
+    h, w = data.shape[:2]
+    rgb = data[:, :, :3].astype(np.float32)
+    
+    # Detect background color if not provided
+    if bg_color is None:
+        corner_size = max(5, min(20, h // 15, w // 15))
+        corners = [
+            rgb[0:corner_size, 0:corner_size],
+            rgb[0:corner_size, w-corner_size:w],
+            rgb[h-corner_size:h, 0:corner_size],
+            rgb[h-corner_size:h, w-corner_size:w],
+        ]
+        all_corners = np.vstack([c.reshape(-1, 3) for c in corners])
+        bg_color = np.median(all_corners, axis=0)
+    
+    bg_color = np.array(bg_color, dtype=np.float32)
+    
+    # Adjust tolerance for very dark/light backgrounds
+    bg_brightness = np.mean(bg_color)
+    if bg_brightness < 15 or bg_brightness > 240:
+        tolerance = max(tolerance, 25)
+    
+    # Find pixels similar to background
+    color_diff = np.sqrt(np.sum((rgb - bg_color) ** 2, axis=2))
+    potential_bg = (color_diff < tolerance).astype(np.uint8) * 255
+    
+    # Flood fill from borders
+    work = potential_bg.copy()
+    for seed in [(0, 0), (w-1, 0), (0, h-1), (w-1, h-1)]:
+        if work[seed[1], seed[0]] > 0:
+            mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+            cv2.floodFill(work, mask, seed, 128)
+    
+    # Additional seeds along edges
+    step = max(1, min(w, h) // 20)
+    for x in range(0, w, step):
+        for y in [0, h-1]:
+            if work[y, x] > 0:
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(work, mask, (x, y), 128)
+    for y in range(0, h, step):
+        for x in [0, w-1]:
+            if work[y, x] > 0:
+                mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+                cv2.floodFill(work, mask, (x, y), 128)
+    
+    # Create alpha
+    connected_bg = work == 128
+    alpha = np.where(connected_bg, 0, 255).astype(np.uint8)
+    
+    # Smooth edges
+    alpha = cv2.GaussianBlur(alpha.astype(np.float32), (3, 3), 0).astype(np.uint8)
+    
+    result = data.copy()
+    result[:, :, 3] = alpha
+    
+    return Image.fromarray(result, 'RGBA'), "color-based"
+
+
+def remove_background(img):
+    """
+    Main background removal function.
     
     Strategy:
-    1. Analyze image characteristics
-    2. For solid backgrounds (logos/graphics): Use color-based (preserves all content)
-    3. For complex backgrounds (photos): Use withoutBG 4-stage pipeline
-    4. Validate result has reasonable content preserved
+    1. Try withoutBG first (best quality, works for everything)
+    2. Fall back to color-based if withoutBG fails
     """
-    img = Image.open(BytesIO(img_bytes))
-    original_pixels = img.width * img.height
+    # Try withoutBG first
+    result, method = remove_bg_withoutbg(img)
     
-    # Analyze image
-    analysis = analyze_image_for_bg_removal(img)
+    if result is not None:
+        return result, method
     
-    method_used = None
-    result_img = None
-    
-    # Decision logic - prefer color-based for solid backgrounds (logos)
-    use_color_method = (
-        analysis['has_solid_bg'] and 
-        analysis['bg_coverage'] > 0.10  # At least 10% is background
-    ) or (
-        analysis['is_graphic'] and 
-        analysis['color_complexity'] < 0.05
-    )
-    
-    if use_color_method:
-        # Determine tolerance based on background color
-        # For light backgrounds (like gray/white), use LOWER tolerance
-        # to avoid removing light-colored content
-        bg_color = analysis.get('bg_color')
-        if bg_color is not None:
-            bg_brightness = np.mean(bg_color)
-            if bg_brightness > 200:  # Very light background
-                base_tolerance = 15
-            elif bg_brightness > 150:  # Light background  
-                base_tolerance = 18
-            elif bg_brightness < 50:  # Very dark background
-                base_tolerance = 15
-            else:  # Medium brightness
-                base_tolerance = 22
-        else:
-            base_tolerance = 20
-        
-        # Try color-based removal with calculated tolerance
-        result_img = remove_bg_color_method(
-            img, 
-            bg_color=analysis['bg_color'],
-            tolerance=base_tolerance
-        )
-        method_used = f"color-based (tol={base_tolerance})"
-        
-        # Validate: check if we preserved reasonable content
-        content_pixels = count_content_pixels(result_img)
-        content_ratio = content_pixels / original_pixels
-        
-        # If too little content (< 3%) or too much (> 98%), adjust tolerance
-        if content_ratio < 0.03:
-            # Too aggressive - try lower tolerance
-            for tol in [12, 10, 8]:
-                alt_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=tol)
-                alt_content = count_content_pixels(alt_result)
-                alt_ratio = alt_content / original_pixels
-                if alt_ratio > 0.03:
-                    result_img = alt_result
-                    method_used = f"color-based (tol={tol}, adjusted)"
-                    break
-        elif content_ratio > 0.98:
-            # Not aggressive enough - try higher tolerance
-            for tol in [25, 30, 35]:
-                alt_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=tol)
-                alt_content = count_content_pixels(alt_result)
-                alt_ratio = alt_content / original_pixels
-                if alt_ratio < 0.98:
-                    result_img = alt_result
-                    method_used = f"color-based (tol={tol}, adjusted)"
-                    break
-    
-    else:
-        # For photos - try withoutBG first (best quality), fallback to rembg
-        withoutbg_result, withoutbg_success, withoutbg_info = remove_bg_withoutbg_method(img)
-        
-        if withoutbg_success and withoutbg_result:
-            result_img = withoutbg_result
-            method_used = withoutbg_info
-            
-            # Validate result
-            content_pixels = count_content_pixels(result_img)
-            content_ratio = content_pixels / original_pixels
-            
-            # If withoutBG removed too much and image has solid bg, try color method
-            if content_ratio < 0.10 and analysis['has_solid_bg']:
-                color_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=20)
-                color_content = count_content_pixels(color_result)
-                
-                if color_content > content_pixels * 1.3:
-                    result_img = color_result
-                    method_used = "color-based (withoutbg fallback)"
-        else:
-            # withoutBG not available, try rembg
-            ai_result, ai_success, ai_info = remove_bg_ai_method(img_bytes)
-            
-            if ai_success and ai_result:
-                result_img = ai_result
-                method_used = f"rembg ({ai_info})"
-                
-                # Validate AI result
-                content_pixels = count_content_pixels(result_img)
-                content_ratio = content_pixels / original_pixels
-                
-                # If AI removed too much, fall back to color method
-                if content_ratio < 0.10 and analysis['has_solid_bg']:
-                    color_result = remove_bg_color_method(img, bg_color=analysis['bg_color'], tolerance=20)
-                    color_content = count_content_pixels(color_result)
-                    
-                    if color_content > content_pixels * 1.3:
-                        result_img = color_result
-                        method_used = "color-based (AI fallback)"
-            else:
-                # No AI available, use color method
-                result_img = remove_bg_color_method(img, tolerance=20)
-                method_used = "color-based (AI unavailable)"
-    
-    # Final fallback
-    if result_img is None:
-        result_img = remove_bg_color_method(img, tolerance=20)
-        method_used = "color-based (fallback)"
-    
-    return result_img, method_used, analysis
+    # Fallback to color-based
+    result, method = remove_bg_color_based(img)
+    return result, method
 
 
-def refine_edges(img_rgba, edge_smoothing=1, feather_amount=0):
-    """
-    Post-process to refine edges and reduce jaggedness
-    Similar to remove.bg's edge refinement
-    """
-    data = np.array(img_rgba)
-    alpha = data[:, :, 3]
+def trim_transparent(img, padding=0):
+    """Remove transparent borders from image"""
+    if img.mode != 'RGBA':
+        return img
     
-    if edge_smoothing > 0:
-        # Smooth alpha channel edges
-        alpha_float = alpha.astype(np.float32)
-        
-        # Apply slight Gaussian blur to alpha for smoother edges
-        kernel_size = edge_smoothing * 2 + 1
-        alpha_smooth = cv2.GaussianBlur(alpha_float, (kernel_size, kernel_size), 0)
-        
-        # Preserve fully opaque and fully transparent areas
-        # Only smooth the transition zones
-        mask = (alpha > 5) & (alpha < 250)
-        alpha = alpha.astype(np.float32)
-        alpha[mask] = alpha_smooth[mask]
-        
-        data[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
+    alpha = np.array(img.split()[3])
+    non_transparent = np.where(alpha > 0)
     
-    if feather_amount > 0:
-        # Feather edges for softer blending
-        alpha = data[:, :, 3].astype(np.float32)
-        
-        # Create edge mask
-        kernel = np.ones((3, 3), np.uint8)
-        dilated = cv2.dilate(alpha, kernel, iterations=feather_amount)
-        eroded = cv2.erode(alpha, kernel, iterations=feather_amount)
-        edge_mask = (dilated - eroded) > 0
-        
-        # Apply gradient to edges
-        blurred = cv2.GaussianBlur(alpha, (feather_amount * 2 + 1, feather_amount * 2 + 1), 0)
-        alpha[edge_mask] = blurred[edge_mask]
-        
-        data[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
+    if len(non_transparent[0]) == 0:
+        return img
     
-    return Image.fromarray(data, 'RGBA')
+    y_min, y_max = non_transparent[0].min(), non_transparent[0].max()
+    x_min, x_max = non_transparent[1].min(), non_transparent[1].max()
+    
+    # Add padding
+    y_min = max(0, y_min - padding)
+    y_max = min(img.height, y_max + padding + 1)
+    x_min = max(0, x_min - padding)
+    x_max = min(img.width, x_max + padding + 1)
+    
+    return img.crop((x_min, y_min, x_max, y_max))
 
 
 @app.route('/remove-bg', methods=['POST'])
 def remove_bg_endpoint():
     """
-    🎯 Professional Background Removal - Automatic, remove.bg quality
+    Remove background from image.
     
-    Automatically analyzes the image and chooses the best removal method:
-    - Logos/graphics with solid backgrounds → Color-based removal (keeps all text/elements)
-    - Photos with complex backgrounds → withoutBG 4-stage AI pipeline
-    
-    Just upload your image - the system handles everything automatically!
+    FAST PATH: If image already has transparency, returns immediately.
     
     Parameters:
-    -----------
-    image: file (required)
-        The image to process (PNG, JPG, WebP supported)
+    - image: File (required)
+    - trim: "true" to auto-crop transparent borders (optional)
+    - output_format: "png" or "webp" (optional, default: png)
     
-    trim: bool (optional, default=false)
-        Auto-crop to remove extra transparent space
-    
-    output_format: string (optional, default='png')
-        Output format: 'png' or 'webp'
-    
-    Returns:
-    --------
-    PNG/WebP image with transparent background
-    
-    Headers:
-    - X-Method-Used: Which removal method was used
-    - X-Processing-Time: Time taken in seconds
+    Returns: PNG/WebP with transparent background
     """
     import time
     start_time = time.time()
     
+    # Auth check
     auth_error = verify_api_key()
     if auth_error:
         return auth_error
     
+    # Validate input
+    if 'image' not in request.files:
+        return jsonify({
+            "error": "No image file provided",
+            "usage": "POST with 'image' file field"
+        }), 400
+    
+    file = request.files['image']
+    do_trim = request.form.get('trim', 'false').lower() == 'true'
+    output_format = request.form.get('output_format', 'png').lower()
+    
     try:
-        # Validate input
-        if 'image' not in request.files:
-            return jsonify({
-                "error": "No image file provided",
-                "usage": {
-                    "endpoint": "/remove-bg",
-                    "method": "POST",
-                    "content_type": "multipart/form-data",
-                    "required_field": "image",
-                    "optional_fields": {
-                        "trim": "true | false (auto-crop transparent space)",
-                        "output_format": "png | webp"
-                    },
-                    "example": "curl -X POST -F 'image=@photo.jpg' http://your-api/remove-bg -o result.png"
-                }
-            }), 400
-        
-        file = request.files['image']
-        
-        # Read parameters
-        do_trim = request.form.get('trim', 'false').lower() == 'true'
-        output_format = request.form.get('output_format', 'png').lower()
-        
-        # Read image bytes
+        # Load image
         img_bytes = file.read()
+        img = Image.open(BytesIO(img_bytes))
+        original_mode = img.mode
+        original_size = f"{img.width}x{img.height}"
         
-        # Smart background removal - automatically chooses best method
-        result_img, method_used, analysis = remove_bg_smart(img_bytes)
-        
-        # Apply edge refinement
-        result_img = refine_edges(result_img, edge_smoothing=1)
-        
-        # Trim whitespace if requested
-        if do_trim:
-            result_img = trim_whitespace(result_img)
+        # ============================================================
+        # FAST PATH: Check if already has transparency
+        # ============================================================
+        if img.mode == 'RGBA' and has_transparency(img):
+            # Already transparent - return as-is (maybe just trim)
+            result_img = img
+            method_used = "skipped (already transparent)"
+            
+            if do_trim:
+                result_img = trim_transparent(result_img)
+        else:
+            # Need to remove background
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            result_img, method_used = remove_background(img)
+            
+            if do_trim:
+                result_img = trim_transparent(result_img)
         
         # Prepare output
         output = BytesIO()
-        
         if output_format == 'webp':
-            result_img.save(output, format='WEBP', quality=95, lossless=False)
+            result_img.save(output, format='WEBP', quality=95)
             mimetype = 'image/webp'
-            extension = 'webp'
         else:
             result_img.save(output, format='PNG', optimize=True)
             mimetype = 'image/png'
-            extension = 'png'
         
         output.seek(0)
-        
         processing_time = time.time() - start_time
         
-        # Return result
+        # Return with headers
         response = send_file(
             output,
             mimetype=mimetype,
             as_attachment=True,
-            download_name=f'removed_bg.{extension}'
+            download_name=f'removed_bg.{output_format}'
         )
         
-        # Add detailed informative headers
         response.headers['X-Method-Used'] = method_used
-        response.headers['X-Image-Type'] = 'logo/graphic' if analysis.get('has_solid_bg') else 'photo'
-        response.headers['X-Has-Solid-BG'] = str(analysis.get('has_solid_bg', False))
-        response.headers['X-Is-Graphic'] = str(analysis.get('is_graphic', False))
-        response.headers['X-BG-Coverage'] = f"{analysis.get('bg_coverage', 0)*100:.1f}%"
-        response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
+        response.headers['X-Original-Mode'] = original_mode
+        response.headers['X-Original-Size'] = original_size
         response.headers['X-Output-Size'] = f"{result_img.width}x{result_img.height}"
+        response.headers['X-Processing-Time'] = f"{processing_time:.2f}s"
         
         return response
         
@@ -642,151 +594,77 @@ def remove_bg_endpoint():
         }), 500
 
 
-@app.route('/remove-bg/info', methods=['GET'])
-def remove_bg_info():
-    """Information about the background removal endpoint"""
-    
-    # Check which AI backends are available
-    withoutbg_available = False
-    rembg_available = False
-    
-    try:
-        from withoutbg import WithoutBG
-        withoutbg_available = True
-    except ImportError:
-        pass
-    
-    try:
-        from rembg import remove
-        rembg_available = True
-    except ImportError:
-        pass
-    
-    return jsonify({
-        "endpoint": "/remove-bg",
-        "description": "Automatic background removal - works like remove.bg",
-        "ai_backends": {
-            "withoutbg": {
-                "available": withoutbg_available,
-                "description": "4-stage pipeline (Depth → ISNet → Matting → Refiner)",
-                "quality": "★★★★★ Best for photos",
-                "model_size": "~320MB (downloaded on first use)"
-            },
-            "rembg": {
-                "available": rembg_available,
-                "description": "ISNet segmentation with alpha matting",
-                "quality": "★★★★ Good for photos",
-                "model_size": "~170MB"
-            },
-            "color_based": {
-                "available": True,
-                "description": "Flood-fill color removal for solid backgrounds",
-                "quality": "★★★★★ Best for logos/graphics",
-                "model_size": "None (no AI needed)"
-            }
-        },
-        "auto_detection": {
-            "logos_graphics": "Uses color-based removal (keeps all text/elements)",
-            "photos": "Uses withoutBG or rembg (handles complex backgrounds)"
-        },
-        "usage": {
-            "simple": "curl -X POST -F 'image=@your-image.png' http://your-api/remove-bg -o result.png",
-            "with_trim": "curl -X POST -F 'image=@your-image.png' -F 'trim=true' http://your-api/remove-bg -o result.png"
-        }
-    })
-
-
 @app.route('/remove-bg/status', methods=['GET'])
-def remove_bg_status():
-    """
-    🔍 Diagnostic endpoint to check AI backend status
-    
-    Use this to verify which background removal methods are available and working.
-    """
+def status():
+    """Check AI backend status"""
     import sys
     
     status = {
-        "python_version": sys.version,
+        "python_version": sys.version.split()[0],
         "backends": {}
     }
     
     # Check withoutBG
-    withoutbg_status = {
-        "installed": False,
-        "version": None,
-        "model_loaded": False,
-        "error": None
-    }
+    withoutbg_status = {"installed": False, "model_loaded": False}
     try:
         import withoutbg as wbg
         withoutbg_status["installed"] = True
         withoutbg_status["version"] = getattr(wbg, '__version__', 'unknown')
         
-        # Check if model is loaded
         global _withoutbg_model
         if _withoutbg_model is not None:
             withoutbg_status["model_loaded"] = True
-            withoutbg_status["model_status"] = "Loaded and ready"
+            withoutbg_status["status"] = "Ready"
         else:
-            withoutbg_status["model_status"] = "Not loaded yet (will load on first photo request)"
-    except ImportError as e:
-        withoutbg_status["error"] = f"Not installed: {str(e)}"
-    except Exception as e:
-        withoutbg_status["error"] = str(e)
+            withoutbg_status["status"] = "Will load on first request"
+    except ImportError:
+        withoutbg_status["status"] = "Not installed"
     
     status["backends"]["withoutbg"] = withoutbg_status
     
-    # Check rembg
-    rembg_status = {
-        "installed": False,
-        "version": None,
-        "error": None
-    }
-    try:
-        import rembg
-        rembg_status["installed"] = True
-        rembg_status["version"] = getattr(rembg, '__version__', 'unknown')
-    except ImportError as e:
-        rembg_status["error"] = f"Not installed: {str(e)}"
-    except Exception as e:
-        rembg_status["error"] = str(e)
-    
-    status["backends"]["rembg"] = rembg_status
-    
     # Check OpenCV
-    cv2_status = {"installed": False, "version": None}
     try:
         import cv2
-        cv2_status["installed"] = True
-        cv2_status["version"] = cv2.__version__
+        status["backends"]["opencv"] = {"installed": True, "version": cv2.__version__}
     except ImportError:
-        cv2_status["installed"] = False
-    
-    status["backends"]["opencv"] = cv2_status
-    
-    # Check numpy
-    numpy_status = {"installed": False, "version": None}
-    try:
-        import numpy as np
-        numpy_status["installed"] = True
-        numpy_status["version"] = np.__version__
-    except ImportError:
-        numpy_status["installed"] = False
-    
-    status["backends"]["numpy"] = numpy_status
+        status["backends"]["opencv"] = {"installed": False}
     
     # Summary
-    status["summary"] = {
-        "photo_processing": "withoutbg" if withoutbg_status["installed"] else ("rembg" if rembg_status["installed"] else "color-based only"),
-        "logo_processing": "color-based (always available)",
-        "ready": True
-    }
+    status["ready"] = withoutbg_status.get("installed", False)
+    status["primary_method"] = "withoutbg" if withoutbg_status.get("installed") else "color-based"
     
     return jsonify(status)
 
 
-@app.route('/remove-bg/test-withoutbg', methods=['POST'])
-def test_withoutbg():
+@app.route('/remove-bg/info', methods=['GET'])
+def info():
+    """Endpoint documentation"""
+    return jsonify({
+        "endpoint": "/remove-bg",
+        "method": "POST",
+        "description": "Remove background from any image",
+        "features": [
+            "Auto-detects if image already has transparency (skips processing)",
+            "Uses withoutBG 4-stage AI pipeline for best quality",
+            "Works for photos, logos, graphics - everything",
+            "Falls back to color-based removal if AI unavailable"
+        ],
+        "parameters": {
+            "image": "File (required) - The image to process",
+            "trim": "String 'true'/'false' (optional) - Auto-crop transparent borders",
+            "output_format": "String 'png'/'webp' (optional) - Output format"
+        },
+        "response_headers": {
+            "X-Method-Used": "Which method processed the image",
+            "X-Processing-Time": "How long it took",
+            "X-Original-Size": "Input dimensions",
+            "X-Output-Size": "Output dimensions"
+        },
+        "usage": {
+            "curl": "curl -X POST -F 'image=@photo.jpg' https://your-api/remove-bg -o result.png",
+            "with_trim": "curl -X POST -F 'image=@photo.jpg' -F 'trim=true' https://your-api/remove-bg -o result.png"
+        }
+    })
     """
     🧪 Test endpoint to force withoutBG processing
     
