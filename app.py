@@ -1,5 +1,5 @@
 from flask import Flask, request, send_file, jsonify
-from PIL import Image
+from PIL import Image, ImageOps
 import numpy as np
 from io import BytesIO
 import os
@@ -51,6 +51,7 @@ def home():
         "authentication": "required" if API_KEY else "not required",
         "endpoints": {
             "/health": "GET - Health check",
+            "/remove-bg": "POST - ✂️ Background removal (RMBG-2.0 + fallbacks)",
             "/process-logo": "POST - 🚀 FULL PIPELINE: enhance → remove bg → trim → generate all variants",
             "/gen-logo-variant": "POST - 🎯 Generate color variant (with enhance, bg removal, trim)",
             "/logo-type": "POST - 🔍 Detect logo type (returns 'black' or 'white')",
@@ -3170,6 +3171,301 @@ def invert_colors():
         
     except Exception as e:
         return jsonify({"error": "Processing failed", "details": str(e)}), 500
+
+
+# ============================================================
+# /remove-bg: High-quality background removal (RMBG-2.0 first)
+# ============================================================
+
+_RMBG2_MODEL = None
+_RMBG2_DEVICE = None
+_RMBG2_LOCK = None
+
+_WITHOUTBG_MODEL = None
+_WITHOUTBG_LOCK = None
+
+_REMBG_SESSION = None
+_REMBG_LOCK = None
+
+
+def _init_locks_once():
+    """Initialize locks lazily (keeps imports minimal during cold start)."""
+    global _RMBG2_LOCK, _WITHOUTBG_LOCK, _REMBG_LOCK
+    if _RMBG2_LOCK is None:
+        import threading
+        _RMBG2_LOCK = threading.Lock()
+    if _WITHOUTBG_LOCK is None:
+        import threading
+        _WITHOUTBG_LOCK = threading.Lock()
+    if _REMBG_LOCK is None:
+        import threading
+        _REMBG_LOCK = threading.Lock()
+
+
+def _pil_from_bytes(image_bytes: bytes) -> Image.Image:
+    img = Image.open(BytesIO(image_bytes))
+    # Normalize EXIF orientation (common for phone photos)
+    return ImageOps.exif_transpose(img)
+
+
+def _has_real_transparency(img: Image.Image) -> bool:
+    """True only if there are pixels with alpha < 255 (not just an alpha channel present)."""
+    # Palette images can store transparency in metadata
+    if 'transparency' in getattr(img, 'info', {}):
+        rgba = img.convert('RGBA')
+        return rgba.getchannel('A').getextrema()[0] < 255
+
+    if img.mode in ('RGBA', 'LA'):
+        return img.getchannel('A').getextrema()[0] < 255
+
+    return False
+
+
+def _alpha_changed_enough(img: Image.Image) -> bool:
+    """Heuristic: ensure background removal actually produced meaningful transparency."""
+    rgba = img.convert('RGBA')
+    alpha = np.array(rgba.getchannel('A'))
+    total = alpha.size
+    # Count pixels that are meaningfully transparent (not just anti-aliased edges)
+    transparent = int((alpha < 250).sum())
+    return transparent > max(500, int(total * 0.002))
+
+
+def _pad_to_square(im: Image.Image, size: int = 1024):
+    """Resize longest side to `size` and pad to (size,size). Returns (padded_img, (left,top,new_w,new_h))."""
+    w, h = im.size
+    if w == 0 or h == 0:
+        raise ValueError('Invalid image size')
+
+    scale = size / float(max(w, h))
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    resized = im.resize((new_w, new_h), Image.BICUBIC)
+
+    canvas = Image.new('RGB', (size, size), (0, 0, 0))
+    left = (size - new_w) // 2
+    top = (size - new_h) // 2
+    canvas.paste(resized, (left, top))
+    return canvas, (left, top, new_w, new_h)
+
+
+def _get_rmbg2():
+    """Lazy-load RMBG-2.0 model (BRIA) if dependencies + weights are available."""
+    global _RMBG2_MODEL, _RMBG2_DEVICE
+
+    _init_locks_once()
+    with _RMBG2_LOCK:
+        if _RMBG2_MODEL is not None:
+            return _RMBG2_MODEL, _RMBG2_DEVICE
+
+        import torch
+        from transformers import AutoModelForImageSegmentation
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+        # trust_remote_code is required by BRIA's implementation
+        model = AutoModelForImageSegmentation.from_pretrained(
+            'briaai/RMBG-2.0',
+            trust_remote_code=True,
+        )
+        model.to(device)
+        model.eval()
+
+        # A small perf hint (safe on CPU too)
+        try:
+            torch.set_float32_matmul_precision('high')
+        except Exception:
+            pass
+
+        _RMBG2_MODEL = model
+        _RMBG2_DEVICE = device
+        return _RMBG2_MODEL, _RMBG2_DEVICE
+
+
+def _remove_bg_rmbg2(img: Image.Image) -> Image.Image:
+    """Run BRIA RMBG-2.0 and return RGBA with alpha matte."""
+    import torch
+    from torchvision import transforms
+
+    model, device = _get_rmbg2()
+
+    base = img.convert('RGB')
+    padded, padinfo = _pad_to_square(base, 1024)
+    left, top, new_w, new_h = padinfo
+
+    to_tensor = transforms.ToTensor()
+    norm = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+
+    x = norm(to_tensor(padded)).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        out = model(x)
+        # BRIA example uses the last element
+        pred = out[-1] if isinstance(out, (list, tuple)) else out
+        pred = pred.sigmoid().detach().cpu()[0].squeeze()
+
+    mask_pil = transforms.ToPILImage()(pred)
+    # Unpad and resize back to original size
+    mask_crop = mask_pil.crop((left, top, left + new_w, top + new_h))
+    mask = mask_crop.resize(img.size, Image.BILINEAR)
+
+    rgba = img.convert('RGBA')
+    rgba.putalpha(mask)
+    return rgba
+
+
+def _get_withoutbg():
+    """Lazy-load withoutbg open-source model (Focus)."""
+    global _WITHOUTBG_MODEL
+    _init_locks_once()
+    with _WITHOUTBG_LOCK:
+        if _WITHOUTBG_MODEL is not None:
+            return _WITHOUTBG_MODEL
+        from withoutbg import WithoutBG
+        _WITHOUTBG_MODEL = WithoutBG.opensource()
+        return _WITHOUTBG_MODEL
+
+
+def _remove_bg_withoutbg(img: Image.Image) -> Image.Image:
+    """Run withoutbg Focus model locally (fallback)."""
+    model = _get_withoutbg()
+
+    tmp_in = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+            tmp_in = f.name
+            img.convert('RGB').save(f, format='PNG')
+
+        result = model.remove_background(tmp_in)
+
+        # The SDK returns an object that supports .save()
+        out_buf = BytesIO()
+        result.save(out_buf, format='PNG')
+        out_buf.seek(0)
+        return Image.open(out_buf).convert('RGBA')
+    finally:
+        if tmp_in and os.path.exists(tmp_in):
+            try:
+                os.remove(tmp_in)
+            except Exception:
+                pass
+
+
+def _get_rembg_session():
+    """Lazy-create a rembg session using a stronger general model."""
+    global _REMBG_SESSION
+    _init_locks_once()
+    with _REMBG_LOCK:
+        if _REMBG_SESSION is not None:
+            return _REMBG_SESSION
+        from rembg import new_session
+        # Better general-purpose model than default u2net for many cases
+        _REMBG_SESSION = new_session('isnet-general-use')
+        return _REMBG_SESSION
+
+
+def _remove_bg_rembg(img: Image.Image) -> Image.Image:
+    from rembg import remove
+    session = _get_rembg_session()
+
+    buf = BytesIO()
+    img.convert('RGB').save(buf, format='PNG')
+    data = buf.getvalue()
+
+    out_bytes = remove(
+        data,
+        session=session,
+        alpha_matting=True,
+        alpha_matting_foreground_threshold=240,
+        alpha_matting_background_threshold=10,
+        alpha_matting_erode_size=10,
+    )
+    return Image.open(BytesIO(out_bytes)).convert('RGBA')
+
+
+def remove_bg_best_effort(image_bytes: bytes):
+    """Best-effort bg removal: skip if already transparent; else RMBG-2.0 → withoutbg → rembg."""
+    img = _pil_from_bytes(image_bytes)
+
+    if _has_real_transparency(img):
+        return img.convert('RGBA'), 'skip_already_transparent'
+
+    # 1) BRIA RMBG-2.0
+    try:
+        out = _remove_bg_rmbg2(img)
+        if _alpha_changed_enough(out):
+            return out, 'rmbg2'
+    except Exception:
+        pass
+
+    # 2) withoutbg Focus (local 4-stage pipeline)
+    try:
+        out = _remove_bg_withoutbg(img)
+        if _alpha_changed_enough(out):
+            return out, 'withoutbg_focus'
+    except Exception:
+        pass
+
+    # 3) rembg (isnet-general-use + alpha matting)
+    try:
+        out = _remove_bg_rembg(img)
+        if _alpha_changed_enough(out):
+            return out, 'rembg_isnet_general_use'
+        return out, 'rembg_isnet_general_use'
+    except Exception:
+        pass
+
+    # If everything fails, just return original as PNG
+    return img.convert('RGBA'), 'no_change'
+
+
+@app.route('/remove-bg', methods=['POST'])
+def remove_bg():
+    """Remove background and return transparent PNG. Accepts only one file field: image."""
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+
+    # Enforce exactly one file param: image
+    if set(request.files.keys()) != {'image'}:
+        return jsonify({"error": "Only one file field is allowed: 'image'"}), 400
+
+    # Allow legacy api_key only (prefer X-API-Key header)
+    extra_form_keys = [k for k in request.form.keys() if k != 'api_key']
+    if extra_form_keys:
+        return jsonify({"error": "No extra parameters allowed", "extra_params": extra_form_keys}), 400
+
+    file = request.files.get('image')
+    if not file or file.filename == '':
+        return jsonify({"error": "No image file provided"}), 400
+
+    try:
+        image_bytes = file.read()
+        if not image_bytes:
+            return jsonify({"error": "Empty image file"}), 400
+
+        out_img, method = remove_bg_best_effort(image_bytes)
+
+        out_buf = BytesIO()
+        out_img.save(out_buf, format='PNG', optimize=True)
+        out_buf.seek(0)
+
+        resp = send_file(
+            out_buf,
+            mimetype='image/png',
+            as_attachment=True,
+            download_name='no_bg.png'
+        )
+        resp.headers['X-RemoveBG-Method'] = method
+        return resp
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Background removal failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
