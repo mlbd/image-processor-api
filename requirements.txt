@@ -5,21 +5,5 @@ gunicorn==22.0.0
 Werkzeug==3.0.3
 opencv-python-headless==4.10.0.84
 requests==2.31.0
-
-# BRIA RMBG-2.0 (best effort primary model)
-torch>=2.2.0
-torchvision>=0.17.0
-transformers>=4.40.0
-kornia>=0.7.0
-
-# Background removal - withoutBG (4-stage pipeline, best quality)
-withoutbg>=1.0.0
-
-# ONNX Runtime - MUST be version 1.18+ to support IR version 10
-onnxruntime>=1.18.0
-
-# Background removal - rembg (fallback option)
 rembg==2.0.50
-pooch>=1.6.0
-pymatting>=1.1.8
-scikit-image>=0.21.0
+fal-client==0.12.0
