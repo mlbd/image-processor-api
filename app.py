@@ -422,11 +422,9 @@ def process_logo():
     2. Remove background (rembg or fallback)
     3. Trim whitespace
     4. Determine logo type (black-ish or white-ish)
-    5. Generate 4 versions:
+    5. Generate 2 versions:
        - original_{type}: The processed original
        - original_{opposite}: Color variant (inverted)
-       - bw_black: Solid black version
-       - bw_white: Solid white version
     6. Create unique folder and upload all 4 to FTP
     
     Returns: JSON with folder_id and image URLs
@@ -566,16 +564,10 @@ def process_logo():
         variant_key = f"original_{opposite_type}"
         variant_img = generate_variant(img, logo_type)
         
-        # Solid black
-        bw_black_img = generate_solid_version(img, "black")
-        
-        # Solid white
-        bw_white_img = generate_solid_version(img, "white")
-        
         processing_log.append({
             "step": "generate_versions",
             "success": True,
-            "versions": [original_key, variant_key, "bw_black", "bw_white"]
+            "versions": [original_key, variant_key]
         })
         
         # ============================================================
@@ -583,9 +575,7 @@ def process_logo():
         # ============================================================
         images_to_upload = {
             f"{original_key}.png": original_img,
-            f"{variant_key}.png": variant_img,
-            "bw_black.png": bw_black_img,
-            "bw_white.png": bw_white_img
+            f"{variant_key}.png": variant_img
         }
         
         urls, ftp_status = upload_images_to_ftp(images_to_upload, folder_id)
@@ -620,14 +610,6 @@ def process_logo():
                 variant_key: {
                     "description": f"Color variant ({opposite_type})",
                     "url": urls[f"{variant_key}.png"]
-                },
-                "bw_black": {
-                    "description": "Solid black version",
-                    "url": urls["bw_black.png"]
-                },
-                "bw_white": {
-                    "description": "Solid white version",
-                    "url": urls["bw_white.png"]
                 }
             }
         })
