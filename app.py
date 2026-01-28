@@ -164,12 +164,15 @@ def remove_bg_endpoint():
     if enforce_error:
         return enforce_error
 
-    file = request.files["image"]
+    file = request.files.get("image")
+    if not file:
+        return jsonify({"error": "Image file missing"}), 400
+
     image_bytes = file.read()
     if not image_bytes:
         return jsonify({"error": "Empty image file"}), 400
 
-    # 1) If already transparent, skip immediately
+    # 1) If already transparent → return immediately
     if _img_bytes_has_transparency(image_bytes):
         out_bytes = _to_png_bytes(image_bytes)
         resp = send_file(
@@ -181,39 +184,41 @@ def remove_bg_endpoint():
         resp.headers["X-RemoveBG-Method"] = "skip_already_transparent"
         return resp
 
-    # 2) Try RMBG 2.0 on fal.ai if configured
-    out_bytes = None
-    method = None
+    # 2) Try fal.ai RMBG-2.0
     if os.environ.get("FAL_KEY") or os.environ.get("FAL_API_KEY"):
         try:
             out_bytes = _remove_bg_via_fal_rmbg2(image_bytes)
-            method = "fal_rmbg2"
+
+            # Safety: ensure valid RGBA PNG
+            out_img = Image.open(BytesIO(out_bytes)).convert("RGBA")
+            buf = BytesIO()
+            out_img.save(buf, format="PNG", optimize=True)
+
+            resp = send_file(
+                BytesIO(buf.getvalue()),
+                mimetype="image/png",
+                as_attachment=False,
+                download_name="no_bg.png"
+            )
+            resp.headers["X-RemoveBG-Method"] = "fal_rmbg2"
+            return resp
+
         except Exception:
-            out_bytes = None
-            method = None
+            # fal failed → fall through to original image
+            pass
 
-    # 3) Local fallback
-    if out_bytes is None:
-        out_bytes = _remove_bg_local_rembg(image_bytes)
-        method = "rembg_local"
-
-    # Ensure final output is PNG RGBA
-    try:
-        out_img = Image.open(BytesIO(out_bytes)).convert("RGBA")
-        buf = BytesIO()
-        out_img.save(buf, format="PNG", optimize=True)
-        out_bytes = buf.getvalue()
-    except Exception:
-        pass
+    # 3) fal not configured OR failed → return original image
+    original_png = _to_png_bytes(image_bytes)
 
     resp = send_file(
-        BytesIO(out_bytes),
+        BytesIO(original_png),
         mimetype="image/png",
         as_attachment=False,
         download_name="no_bg.png"
     )
-    resp.headers["X-RemoveBG-Method"] = method or "unknown"
+    resp.headers["X-RemoveBG-Method"] = "fal_failed_return_original"
     return resp
+
 
 @app.route('/', methods=['GET'])
 def home():
